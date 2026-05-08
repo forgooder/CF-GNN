@@ -118,6 +118,8 @@ class RGCNBasisLayer(RGCNLayer):
         g.edata['w'] = self.edge_dropout(torch.ones(g.number_of_edges(), 1).to(weight.device))
 
         input_ = 'feat' if self.is_input_layer else 'h'
+        use_cignn_mask = getattr(g, 'use_cignn_mask', False)
+        cignn_mask_mode = getattr(g, 'cignn_mask_mode', 'none')
 
         def msg_func(edges):
             # 1. 基础关系权重提取
@@ -127,14 +129,10 @@ class RGCNBasisLayer(RGCNLayer):
             # 这里的 edges.data['w'] 是 Edge Dropout 的权重 [batch_e, 1]
             msg = edges.data['w'] * torch.bmm(edges.src[input_].unsqueeze(1), w).squeeze(1)
             
-            # --- ★ 核心注入：因果去噪滤镜 (修正版) ★ ---
-            if 'causal_mask' in edges.data:
-                # 关键：确保 mask 的形状是 [batch_e, 1]，这样才能和 [batch_e, out_dim] 广播乘法
-                mask = edges.data['causal_mask'].view(-1, 1) 
-                
-                # 软剪枝：每一条边的消息都会乘以它对应的因果信任分
+            if use_cignn_mask and cignn_mask_mode in ('message_only', 'both') and 'effective_cignn_mask' in edges.data:
+                mask = edges.data['effective_cignn_mask'].view(-1, 1)
                 msg = msg * mask
-            # ------------------------------------------
+                g.message_mask_applied = True
 
             # 3. 目标节点的自环特征
             curr_emb = torch.mm(edges.dst[input_], self.self_loop_weight)
@@ -147,8 +145,9 @@ class RGCNBasisLayer(RGCNLayer):
                 a = torch.sigmoid(self.B(F.relu(self.A(e))))
             else:
                 a = torch.ones((len(edges), 1)).to(device=w.device)
-            if 'causal_mask' in edges.data:
-                a = a * edges.data['causal_mask'].view(-1, 1)
+            if use_cignn_mask and cignn_mask_mode in ('attention_only', 'both') and 'effective_cignn_mask' in edges.data:
+                a = a * edges.data['effective_cignn_mask'].view(-1, 1)
+                g.attention_mask_applied = True
 
             return {'curr_emb': curr_emb, 'msg': msg, 'alpha': a}
 

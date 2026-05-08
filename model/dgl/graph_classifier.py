@@ -39,6 +39,13 @@ class GraphClassifier(nn.Module):
 
             g = g.to(device)
             rel_labels = rel_labels.to(device)
+            use_cignn_mask = (
+                getattr(self.params, 'use_cignn_mask', False)
+                and getattr(self.params, 'cignn_mask_mode', 'none') != 'none'
+            )
+            if not use_cignn_mask:
+                return self.forward(data=g, rel_labels=rel_labels)
+
             node_feats = g.ndata['feat']
 
             # VAE 编码分离 alpha/beta
@@ -55,6 +62,7 @@ class GraphClassifier(nn.Module):
     def forward(self, data, *args, **kwargs):
         # 兼容性处理：从 args 或 kwargs 中提取 rel_labels 和 edge_weight
         edge_weight = kwargs.get('edge_weight', None)
+        edge_mask_logits = kwargs.get('edge_mask_logits', None)
         rel_labels = kwargs.get('rel_labels', None)
 
         # 处理位置参数
@@ -76,7 +84,7 @@ class GraphClassifier(nn.Module):
             rel_labels = rel_labels[0]
 
         # --- 核心计算逻辑 ---
-        node_repr_all = self.gnn(g, edge_weight=edge_weight) 
+        node_repr_all = self.gnn(g, edge_weight=edge_weight, edge_mask_logits=edge_mask_logits) 
         node_repr_flat = node_repr_all.view(node_repr_all.shape[0], -1)
 
         head_ids = (g.ndata['id'] == 1).nonzero().squeeze(1)

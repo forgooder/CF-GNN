@@ -107,35 +107,57 @@ class RGCN(nn.Module):
         adj_rec = torch.matmul(z, z.t()) 
         return x_rec, adj_rec
 
-    def forward(self, g, edge_weight=None):
-        # --- 1. 初始化掩码 ---
-        # 这里的设备转换要确保和 g 一致
+    def forward(self, g, edge_weight=None, edge_mask_logits=None):
         device = next(self.parameters()).device
-        
-        h_raw = g.ndata['feat'].clone()
+        use_cignn_mask = (
+            getattr(self.params, 'use_cignn_mask', False)
+            and getattr(self.params, 'cignn_mask_mode', 'none') != 'none'
+        )
+        g.use_cignn_mask = use_cignn_mask
+        g.cignn_mask_mode = getattr(self.params, 'cignn_mask_mode', 'none')
+        g.vae_encoder_called = False
+        g.message_mask_applied = False
+        g.attention_mask_applied = False
+        g.mask_logits_ref = None
+        g.raw_mask_ref = None
+        g.effective_mask_ref = None
 
-        if edge_weight is not None:
-            g.edata['causal_mask'] = edge_weight.to(device).view(-1, 1)
-        else:
-            g.edata['causal_mask'] = torch.ones(g.number_of_edges(), 1).to(device)
-        
-        # 使用 8 维特征进行 VAE 编码，这样维度就匹配了 [N, 8] @ [8, 64]
-        z, mu, logvar = self.encoder(g, h_raw) 
-        self.mu, self.logvar = mu, logvar
+        if 'causal_mask' in g.edata:
+            g.edata.pop('causal_mask')
+        if 'raw_cignn_mask' in g.edata:
+            g.edata.pop('raw_cignn_mask')
+        if 'effective_cignn_mask' in g.edata:
+            g.edata.pop('effective_cignn_mask')
 
-        # --- 3. 因果掩码生成 (Alpha 逻辑) ---
-        mid = z.shape[1] // 2
-        alpha = z[:, :mid]
-        u, v = g.edges()
+        if use_cignn_mask and edge_weight is not None:
+            raw_mask = edge_weight.to(device).view(-1, 1)
+            gamma = getattr(self.params, 'current_mask_gamma', getattr(self.params, 'mask_injection_gamma', 0.0))
+            effective_mask = 1.0 - gamma + gamma * raw_mask
+            g.edata['raw_cignn_mask'] = raw_mask
+            g.edata['effective_cignn_mask'] = effective_mask
+            g.mask_logits_ref = edge_mask_logits.to(device).view(-1, 1) if edge_mask_logits is not None else None
+            g.raw_mask_ref = raw_mask
+            g.effective_mask_ref = effective_mask
         
-        if edge_weight is None:
-            # 没有外部干预权重时，使用 alpha 相似度生成默认因果掩码。
+        if use_cignn_mask and edge_weight is None:
+            h_raw = g.ndata['feat'].clone()
+            z, mu, logvar = self.encoder(g, h_raw)
+            g.vae_encoder_called = True
+            self.mu, self.logvar = mu, logvar
+
+            mid = z.shape[1] // 2
+            alpha = z[:, :mid]
+            u, v = g.edges()
             e_score = torch.sum(alpha[u] * alpha[v], dim=1, keepdim=True)
-            causal_mask = torch.sigmoid(e_score)
-            g.edata['causal_mask'] = causal_mask
+            raw_mask = torch.sigmoid(e_score)
+            gamma = getattr(self.params, 'current_mask_gamma', getattr(self.params, 'mask_injection_gamma', 0.0))
+            effective_mask = 1.0 - gamma + gamma * raw_mask
+            g.edata['raw_cignn_mask'] = raw_mask
+            g.edata['effective_cignn_mask'] = effective_mask
+            g.mask_logits_ref = e_score
+            g.raw_mask_ref = raw_mask
+            g.effective_mask_ref = effective_mask
 
-        # --- 4. 执行 RGCN 卷积推理 ---
-        # 现在所有的卷积层（包括第一层）都会在 msg_func 里读取到刚才生成的 'causal_mask'
         for i, layer in enumerate(self.layers):
             layer(g, self.attn_rel_emb)
 

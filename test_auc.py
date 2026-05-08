@@ -3,12 +3,13 @@ import os
 import argparse
 import logging
 import random
+import hashlib
 import torch
 import numpy as np
 from scipy.sparse import SparseEfficiencyWarning
 
 from subgraph_extraction.datasets import SubgraphDataset, generate_subgraph_datasets
-from utils.initialization_utils import initialize_experiment, initialize_model
+from utils.initialization_utils import initialize_model
 from utils.graph_utils import collate_dgl, move_batch_to_device_dgl
 from managers.evaluator import Evaluator
 
@@ -37,50 +38,93 @@ def set_random_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
+def _with_default(params, name, value):
+    if not hasattr(params, name) or getattr(params, name) is None:
+        setattr(params, name, value)
+
+
+def _log_eval_configuration(params):
+    logging.info("Loaded params.json: %s", params.config_path)
+    logging.info("Checkpoint path: %s", params.checkpoint_path)
+    logging.info("Dataset: %s", params.dataset)
+    logging.info(
+        "Model config: emb_dim=%s, rel_emb_dim=%s, attn_rel_emb_dim=%s, "
+        "num_gcn_layers=%s, num_bases=%s, has_attn=%s, add_ht_emb=%s",
+        params.emb_dim, params.rel_emb_dim, params.attn_rel_emb_dim,
+        params.num_gcn_layers, params.num_bases, params.has_attn,
+        params.add_ht_emb
+    )
+    logging.info("CIGNN mask enabled: %s", params.use_cignn_mask)
+    logging.info("CIGNN mask mode: %s", params.cignn_mask_mode)
+    logging.info("VAE loss enabled: %s", params.use_vae_loss)
+    logging.info("MI loss enabled: %s", params.use_mi_loss)
+    logging.info("CMI loss enabled: %s", params.use_cmi_loss)
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def main(params):
     simplefilter(action='ignore', category=UserWarning)
     simplefilter(action='ignore', category=SparseEfficiencyWarning)
 
-    # 1. 强制确定真实的训练输出目录
     actual_train_dir = os.path.join(os.getcwd(), 'experiments', params.experiment_name)
     config_path = os.path.join(actual_train_dir, 'params.json')
+    checkpoint_path = os.path.join(actual_train_dir, 'best_model.pth')
     
-    # 2. 从 JSON 同步配置
-    if os.path.exists(config_path):
-        logging.info(f"正在同步配置: {config_path}")
-        with open(config_path, 'r') as f:
-            train_params = json.load(f)
-        for key, value in train_params.items():
-            if key != 'exp_dir':
-                setattr(params, key, value)
-    
-    # 3. 🌟 核心修复：注入动态参数 (骨架图纸)
-    # 必须在 initialize_model 之前，防止 RGCN 初始化报 AttributeError
-    if not hasattr(params, 'max_label_value') or params.max_label_value is None:
-        params.max_label_value = params.hop 
-        logging.info(f"✅ 参数注入: max_label_value = {params.max_label_value}")
-        
-    
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f'Training params.json not found: {config_path}')
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f'best_model.pth not found: {checkpoint_path}')
 
-    # 4. 补全 RGCN 必须的所有超参数（保底补丁）
-    must_have = {
-        'emb_dim': 64, 
-        'latent_dim': 64,
-        'rel_emb_dim': 64, 
-        'attn_rel_emb_dim': 64, 
-        'num_gcn_layers': 3, 'num_bases': 4, 'dropout': 0, 
-        'edge_dropout': 0.5, 'gnn_agg_type': 'sum', 'has_attn': True, 
-        'add_ht_emb': True, 'inp_dim': 8, 'stage': 1,
-        'max_links': 1000000 ,# 🌟 加上这一行，解决当前的报错
-        'max_nodes_per_hop': None , # 🌟 修复：对应当前的报错，None 表示不限制
-        'use_kge_embeddings': False, 
-        'kge_model': 'TransE'
+    before_params_hash = _file_sha256(config_path)
+    logging.info("Before test params hash: %s", before_params_hash)
+
+    logging.info("Reading training configuration from %s", config_path)
+    with open(config_path, 'r') as f:
+        train_params = json.load(f)
+
+    cli_params = vars(params).copy()
+    for key, value in train_params.items():
+        if key not in {'exp_dir', 'device', 'collate_fn', 'move_batch_to_device'}:
+            setattr(params, key, value)
+
+    params.test_file = cli_params['test_file']
+    params.runs = cli_params['runs']
+    params.seed = cli_params['seed']
+    params.gpu = cli_params['gpu']
+    params.disable_cuda = cli_params['disable_cuda']
+    params.num_workers = cli_params['num_workers']
+    params.batch_size = cli_params['batch_size']
+    params.regenerate_test_subgraphs = cli_params['regenerate_test_subgraphs']
+    params.main_dir = os.getcwd()
+    params.exp_dir = actual_train_dir
+    params.config_path = config_path
+    params.checkpoint_path = checkpoint_path
+    
+    defaults = {
+        'emb_dim': 64, 'latent_dim': 64, 'rel_emb_dim': 64,
+        'attn_rel_emb_dim': 64, 'num_gcn_layers': 3, 'num_bases': 4,
+        'dropout': 0, 'edge_dropout': 0.5, 'gnn_agg_type': 'sum',
+        'has_attn': True, 'add_ht_emb': True, 'inp_dim': 8, 'stage': 1,
+        'max_links': 1000000, 'max_nodes_per_hop': None,
+        'use_kge_embeddings': False, 'kge_model': 'TransE',
+        'use_cignn_mask': False, 'use_vae_loss': False,
+        'use_mi_loss': False, 'use_cmi_loss': False,
+        'pretrain_vae_only': False, 'load_pretrained_vae': '',
+        'freeze_vae_after_pretrain': False, 'cignn_mask_mode': 'none',
+        'mask_injection_gamma': 0.0, 'mask_gamma_schedule': 'none',
+        'mask_ramp_epochs': 0, 'debug_baseline_check': False,
+        'debug_grad_check': False,
     }
-    for k, v in must_have.items():
-        if not hasattr(params, k) or getattr(params, k) is None:
-            setattr(params, k, v)
+    for key, value in defaults.items():
+        _with_default(params, key, value)
 
-    # 5. 维度确认：确保 num_rels 正确
     if not hasattr(params, 'num_rels') or params.num_rels is None:
         rels = set()
         train_path = os.path.join(os.getcwd(), f'data/{params.dataset}/train.txt')
@@ -91,10 +135,11 @@ def main(params):
         params.num_rels = len(rels)
         params.aug_num_rels = params.num_rels
 
-    logging.info(f"✅ 配置锁定：Relations={params.num_rels}, MaxLabel={params.max_label_value}, Emb={params.emb_dim}")
+    if not hasattr(params, 'max_label_value') or params.max_label_value is None:
+        params.max_label_value = params.hop
 
-    # 6. 🌟 加载模型 (现在它会先建骨架，再填权重)
-    params.exp_dir = actual_train_dir 
+    _log_eval_configuration(params)
+
     graph_classifier = initialize_model(params, GraphClassifier, load_model=True)
 
     logging.info(f"Device: {params.device}")
@@ -135,6 +180,13 @@ def main(params):
     logging.info(f'Final Mean AUC: {np.mean(all_auc):.4f}')
     logging.info(f'Final Mean AUC-PR: {np.mean(all_auc_pr):.4f}')
 
+    after_params_hash = _file_sha256(config_path)
+    logging.info("After test params hash: %s", after_params_hash)
+    if after_params_hash != before_params_hash:
+        raise RuntimeError(
+            f'params.json changed during test: before={before_params_hash}, after={after_params_hash}'
+        )
+
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser()
@@ -160,9 +212,6 @@ if __name__ == '__main__':
     
     # 路径拼接逻辑：对应 experiments/MyRun/WN18RR_v1_exp
     params.experiment_name = os.path.join(params.experiment_name, f"{params.dataset}_exp")
-    
-    # 初始化实验目录 (生成 test 相关日志目录)
-    initialize_experiment(params, __file__)
 
     params.file_paths = {
         'train': os.path.join(params.main_dir, 'data/{}/train.txt'.format(params.dataset)),

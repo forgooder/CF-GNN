@@ -43,11 +43,14 @@ def initialize_model(params, model_class, load_model=False):
     '''
     # 1. 确定权重文件路径
     # 确保文件名与你 Trainer.py 中保存的一致 (如果是 best_model.pth 请手动改下面)
-    if params.stage == 2 and load_model:
+    if load_model and hasattr(params, 'checkpoint_path'):
+        checkpoint_path = params.checkpoint_path
+    elif getattr(params, 'stage', 1) == 2 and load_model:
         checkpoint_path = os.path.join(params.exp_dir, 'model_stage1.pth')
     else:
         # 🌟 检查点：如果你 Trainer 里存的是 best_model.pth，这里也要改成 best_model.pth
         checkpoint_path = os.path.join(params.exp_dir, 'best_model.pth')
+    params.checkpoint_path = checkpoint_path
 
     # 2. 准备 relation2id (无论加载还是新建都需要)
     relation2id_path = os.path.join(params.main_dir, f'data/{params.dataset}/relation2id.json')
@@ -71,22 +74,131 @@ def initialize_model(params, model_class, load_model=False):
 
     # 4. 🌟 灌注“记忆”：如果是加载模式且文件存在，则加载权重
     if load_model:
-        if os.path.exists(checkpoint_path):
-            logging.info('Loading weights from %s' % checkpoint_path)
-            try:
-                # 使用 map_location 确保跨 GPU/CPU 加载不崩溃
-                checkpoint = torch.load(checkpoint_path, map_location=params.device)
-                
-                # 兼容性处理：无论存的是 state_dict 还是整个模型对象都能解开
-                if isinstance(checkpoint, dict):
-                    graph_classifier.load_state_dict(checkpoint)
-                else:
-                    # 如果存的是整个模型对象，提取它的权重字典
-                    graph_classifier.load_state_dict(checkpoint.state_dict())
-                logging.info("✅ Weights loaded successfully.")
-            except Exception as e:
-                logging.error(f"❌ Error loading weights: {e}")
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f'Model checkpoint not found: {checkpoint_path}')
+
+        logging.info('Loading weights from %s' % checkpoint_path)
+        checkpoint = torch.load(checkpoint_path, map_location=params.device)
+
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            checkpoint_format = 'checkpoint_dict'
+            if checkpoint.get('is_full_prediction_model') is False:
+                raise RuntimeError(
+                    f"Checkpoint is not a full prediction model: {checkpoint_path}"
+                )
+            state_dict = checkpoint['model_state_dict']
+        elif isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+            checkpoint_format = 'checkpoint_dict'
+            state_dict = checkpoint['state_dict']
+        elif isinstance(checkpoint, dict):
+            checkpoint_format = 'raw_state_dict'
+            state_dict = checkpoint
         else:
-            logging.warning(f'⚠️ No existing model found at {checkpoint_path}. Running with random initialization.')
+            checkpoint_format = 'model_object'
+            logging.info('Loaded checkpoint is not a dict; using checkpoint.state_dict().')
+            state_dict = checkpoint.state_dict()
+
+        model_state = graph_classifier.state_dict()
+        model_keys = set(model_state.keys())
+        checkpoint_keys = set(state_dict.keys())
+        missing_keys = sorted(model_keys - checkpoint_keys)
+        unexpected_keys = sorted(checkpoint_keys - model_keys)
+        size_mismatches = sorted([
+            key for key in model_keys & checkpoint_keys
+            if model_state[key].shape != state_dict[key].shape
+        ])
+
+        logging.info("Loaded checkpoint format: %s", checkpoint_format)
+        logging.info("Loaded model keys count: %s", len(state_dict))
+        logging.info("Missing keys: %s", missing_keys)
+        logging.info("Unexpected keys: %s", unexpected_keys)
+        if size_mismatches:
+            logging.info("Size mismatches: %s", size_mismatches)
+            details = [
+                f"{key}: model={tuple(model_state[key].shape)} checkpoint={tuple(state_dict[key].shape)}"
+                for key in size_mismatches
+            ]
+            raise RuntimeError("Checkpoint size mismatch: " + "; ".join(details))
+        if missing_keys or unexpected_keys:
+            raise RuntimeError(
+                f"Checkpoint key mismatch. Missing keys: {missing_keys}; "
+                f"Unexpected keys: {unexpected_keys}"
+            )
+
+        graph_classifier.load_state_dict(state_dict, strict=True)
+        logging.info("Weights loaded strictly.")
 
     return graph_classifier
+
+
+def load_pretrained_vae_branch(params, graph_classifier):
+    checkpoint_path = getattr(params, 'load_pretrained_vae', '')
+    if not checkpoint_path:
+        return
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f'Pretrained VAE checkpoint not found: {checkpoint_path}')
+
+    logging.info('Loading pretrained VAE/mask branch from %s', checkpoint_path)
+    checkpoint = torch.load(checkpoint_path, map_location=params.device)
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        source_state = checkpoint['model_state_dict']
+    elif isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+        source_state = checkpoint['state_dict']
+    elif isinstance(checkpoint, dict):
+        source_state = checkpoint
+    else:
+        source_state = checkpoint.state_dict()
+
+    model_state = graph_classifier.state_dict()
+    branch_prefixes = ('gnn.encoder.', 'gnn.casual_decoder.')
+    expected_keys = sorted([
+        key for key in model_state
+        if key.startswith(branch_prefixes)
+    ])
+    branch_state = {
+        key: value for key, value in source_state.items()
+        if key.startswith(branch_prefixes)
+    }
+
+    missing_keys = sorted(set(expected_keys) - set(branch_state.keys()))
+    unexpected_branch_keys = sorted([
+        key for key in branch_state
+        if key not in model_state
+    ])
+    size_mismatches = sorted([
+        key for key in set(expected_keys) & set(branch_state.keys())
+        if model_state[key].shape != branch_state[key].shape
+    ])
+    if missing_keys or unexpected_branch_keys or size_mismatches:
+        raise RuntimeError(
+            "Pretrained VAE key mismatch. "
+            f"Missing keys: {missing_keys}; "
+            f"Unexpected branch keys: {unexpected_branch_keys}; "
+            f"Size mismatches: {size_mismatches}"
+        )
+
+    merged_state = dict(model_state)
+    merged_state.update(branch_state)
+    graph_classifier.load_state_dict(merged_state, strict=True)
+
+    loaded_tensor_count = len(branch_state)
+    loaded_param_count = sum(value.numel() for value in branch_state.values())
+    not_loaded_names = sorted([
+        key for key in model_state
+        if key not in branch_state
+    ])
+    logging.info(
+        "Loaded VAE/mask tensors: %s; scalar parameters: %s",
+        loaded_tensor_count,
+        loaded_param_count
+    )
+    logging.info("Parameters not loaded from pretrained VAE: %s", not_loaded_names)
+
+    if getattr(params, 'freeze_vae_after_pretrain', False):
+        for parameter in graph_classifier.gnn.encoder.parameters():
+            parameter.requires_grad = False
+        for parameter in graph_classifier.gnn.casual_decoder.parameters():
+            parameter.requires_grad = False
+        logging.info("Pretrained VAE/mask branch frozen.")
+    else:
+        logging.info("Pretrained VAE/mask branch will be finetuned.")

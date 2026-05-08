@@ -27,7 +27,7 @@ import dgl
 import torch
 from utils.utils_cignn import calculate_conditional_MI
 
-def joint_uncond(alpha, beta, data, rel_labels, casual_decoder, classifier, device, k):
+def joint_uncond(alpha, beta, data, rel_labels, casual_decoder, classifier, device, k, compute_cmi=False):
     # 0) 脱壳与设备同步
     while isinstance(rel_labels, (tuple, list)):
         rel_labels = rel_labels[0]
@@ -54,16 +54,24 @@ def joint_uncond(alpha, beta, data, rel_labels, casual_decoder, classifier, devi
     # 4) 因果掩码生成
     z_casual = casual_decoder(alpha) # [N, d_hidden]
     # 计算边两端节点的点积得到边权重
-    aedge_logits = torch.sum(z_casual[u] * z_casual[v], dim=1)
-    aedge = torch.sigmoid(aedge_logits).view(-1, 1) # [E, 1]
+    aedge_logits = torch.sum(z_casual[u] * z_casual[v], dim=1, keepdim=True)
+    aedge = torch.sigmoid(aedge_logits) # [E, 1]
 
     # 5) 执行分类器 (因果干预后的 Forward)
-    logits = classifier(data=data, rel_labels=rel_labels, edge_weight=aedge)
+    logits = classifier(
+        data=data,
+        rel_labels=rel_labels,
+        edge_weight=aedge,
+        edge_mask_logits=aedge_logits
+    )
 
     # 6) 计算条件互信息 (CMI)
-    causal_effect = calculate_conditional_MI(
-        graph_alpha, y_float, graph_beta
-    )
+    if compute_cmi:
+        causal_effect = calculate_conditional_MI(
+            graph_alpha, y_float, graph_beta
+        )
+    else:
+        causal_effect = torch.tensor(0.0, device=device)
 
     return causal_effect, logits
 

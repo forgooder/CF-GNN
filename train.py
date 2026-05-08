@@ -8,7 +8,7 @@ import numpy as np
 from scipy.sparse import SparseEfficiencyWarning
 
 from subgraph_extraction.datasets import SubgraphDataset, generate_subgraph_datasets
-from utils.initialization_utils import initialize_experiment, initialize_model
+from utils.initialization_utils import initialize_experiment, initialize_model, load_pretrained_vae_branch
 from utils.graph_utils import collate_dgl, move_batch_to_device_dgl
 
 from model.dgl.graph_classifier import GraphClassifier as dgl_model
@@ -66,6 +66,7 @@ def main(params):
 
     # 4. 初始化模型 (此时 params 已经包含了完整的动态参数，且已记录在 JSON)
     graph_classifier = initialize_model(params, dgl_model, params.load_model)
+    load_pretrained_vae_branch(params, graph_classifier)
 
     logging.info(f"Device: {params.device}")
     logging.info(f"Exp Dir: {params.exp_dir}")
@@ -141,6 +142,21 @@ if __name__ == '__main__':
     parser.add_argument('--gnn_agg_type', '-a', type=str, choices=['sum', 'mlp', 'gru'], default='sum')
     parser.add_argument('--add_ht_emb', '-ht', type=str2bool, default=True)
     parser.add_argument('--has_attn', '-attn', type=str2bool, default=True)
+    parser.add_argument('--use_cignn_mask', type=str2bool, default=False)
+    parser.add_argument('--use_vae_loss', type=str2bool, default=False)
+    parser.add_argument('--use_mi_loss', type=str2bool, default=False)
+    parser.add_argument('--use_cmi_loss', type=str2bool, default=False)
+    parser.add_argument('--pretrain_vae_only', type=str2bool, default=False)
+    parser.add_argument('--load_pretrained_vae', type=str, default='')
+    parser.add_argument('--freeze_vae_after_pretrain', type=str2bool, default=False)
+    parser.add_argument('--cignn_mask_mode', type=str,
+                        choices=['none', 'message_only', 'attention_only', 'both'],
+                        default='none')
+    parser.add_argument('--mask_injection_gamma', type=float, default=0.0)
+    parser.add_argument('--mask_gamma_schedule', type=str, choices=['none', 'linear'], default='none')
+    parser.add_argument('--mask_ramp_epochs', type=int, default=0)
+    parser.add_argument('--debug_baseline_check', type=str2bool, default=False)
+    parser.add_argument('--debug_grad_check', type=str2bool, default=False)
 
     params = parser.parse_args()
     set_random_seed(params.seed)
