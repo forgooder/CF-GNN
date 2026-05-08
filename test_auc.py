@@ -46,7 +46,8 @@ def _with_default(params, name, value):
 def _log_eval_configuration(params):
     logging.info("Loaded params.json: %s", params.config_path)
     logging.info("Checkpoint path: %s", params.checkpoint_path)
-    logging.info("Dataset: %s", params.dataset)
+    logging.info("Train dataset: %s", params.train_dataset)
+    logging.info("Test dataset: %s", params.test_dataset)
     logging.info(
         "Model config: emb_dim=%s, rel_emb_dim=%s, attn_rel_emb_dim=%s, "
         "num_gcn_layers=%s, num_bases=%s, has_attn=%s, add_ht_emb=%s",
@@ -69,11 +70,30 @@ def _file_sha256(path):
     return digest.hexdigest()
 
 
+def _infer_train_dataset(test_dataset):
+    return test_dataset[:-4] if test_dataset.endswith('_ind') else test_dataset
+
+
+def _resolve_train_dir(experiment_name, train_dataset, test_dataset):
+    candidates = [
+        os.path.join(os.getcwd(), 'experiments', experiment_name, f'{train_dataset}_exp'),
+        os.path.join(os.getcwd(), 'experiments', experiment_name, f'{test_dataset}_exp'),
+        os.path.join(os.getcwd(), 'experiments', experiment_name),
+    ]
+    for candidate in candidates:
+        if os.path.exists(os.path.join(candidate, 'params.json')):
+            return candidate
+    return candidates[0]
+
+
 def main(params):
     simplefilter(action='ignore', category=UserWarning)
     simplefilter(action='ignore', category=SparseEfficiencyWarning)
 
-    actual_train_dir = os.path.join(os.getcwd(), 'experiments', params.experiment_name)
+    cli_params = vars(params).copy()
+    test_dataset = cli_params['dataset']
+    train_dataset = cli_params['train_dataset'] or _infer_train_dataset(test_dataset)
+    actual_train_dir = _resolve_train_dir(params.experiment_name, train_dataset, test_dataset)
     config_path = os.path.join(actual_train_dir, 'params.json')
     checkpoint_path = os.path.join(actual_train_dir, 'best_model.pth')
     
@@ -89,11 +109,13 @@ def main(params):
     with open(config_path, 'r') as f:
         train_params = json.load(f)
 
-    cli_params = vars(params).copy()
     for key, value in train_params.items():
         if key not in {'exp_dir', 'device', 'collate_fn', 'move_batch_to_device'}:
             setattr(params, key, value)
 
+    params.train_dataset = train_params.get('dataset', train_dataset)
+    params.test_dataset = test_dataset
+    params.dataset = params.train_dataset
     params.test_file = cli_params['test_file']
     params.runs = cli_params['runs']
     params.seed = cli_params['seed']
@@ -127,7 +149,7 @@ def main(params):
 
     if not hasattr(params, 'num_rels') or params.num_rels is None:
         rels = set()
-        train_path = os.path.join(os.getcwd(), f'data/{params.dataset}/train.txt')
+        train_path = os.path.join(os.getcwd(), f'data/{params.train_dataset}/train.txt')
         with open(train_path, 'r') as f:
             for line in f:
                 parts = line.strip().split('\t')
@@ -141,6 +163,11 @@ def main(params):
     _log_eval_configuration(params)
 
     graph_classifier = initialize_model(params, GraphClassifier, load_model=True)
+    params.dataset = params.test_dataset
+    params.file_paths = {
+        'train': os.path.join(params.main_dir, 'data/{}/train.txt'.format(params.test_dataset)),
+        'test': os.path.join(params.main_dir, 'data/{}/{}.txt'.format(params.test_dataset, params.test_file))
+    }
 
     logging.info(f"Device: {params.device}")
     
@@ -192,6 +219,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--experiment_name", "-e", type=str, default="causal_run")
     parser.add_argument("--dataset", "-d", type=str, required=True)
+    parser.add_argument("--train_dataset", type=str, default=None)
     parser.add_argument("--test_file", "-t", type=str, default="test")
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--seed", type=int, default=1234)
@@ -210,9 +238,6 @@ if __name__ == '__main__':
     set_random_seed(params.seed)
     params.main_dir = os.getcwd()
     
-    # 路径拼接逻辑：对应 experiments/MyRun/WN18RR_v1_exp
-    params.experiment_name = os.path.join(params.experiment_name, f"{params.dataset}_exp")
-
     params.file_paths = {
         'train': os.path.join(params.main_dir, 'data/{}/train.txt'.format(params.dataset)),
         'test': os.path.join(params.main_dir, 'data/{}/{}.txt'.format(params.dataset, params.test_file))
