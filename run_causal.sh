@@ -12,6 +12,7 @@ echo "🚀 开始 Causal-GraIL 统一自动化训练 (CIGNN 风格)..."
 python train.py \
     -d $DATASET \
     -e $EXP_NAME \
+    --causal_mode full \
     --gpu $GPU_ID \
     --num_epochs 100 \
     --batch_size 16 \

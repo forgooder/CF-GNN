@@ -219,11 +219,11 @@ def calculate_gram_mat(x: torch.Tensor, sigma: float) -> torch.Tensor:
     if x.dim() == 1:
         x = x.unsqueeze(1)
 
-    with torch.no_grad():
-        x_flat = x.view(x.size(0), -1)
-        xx = (x_flat ** 2).sum(dim=1, keepdim=True)
-        sq_dist = xx + xx.t() - 2.0 * x_flat @ x_flat.t()
-        sq_dist = torch.clamp(sq_dist, min=0.0)
+    # Keep this path differentiable so MI/CMI losses can train alpha/beta.
+    x_flat = x.view(x.size(0), -1)
+    xx = (x_flat ** 2).sum(dim=1, keepdim=True)
+    sq_dist = xx + xx.t() - 2.0 * x_flat @ x_flat.t()
+    sq_dist = torch.clamp(sq_dist, min=0.0)
 
     K = torch.exp(-sq_dist / (2.0 * (sigma ** 2) + 1e-12))
 

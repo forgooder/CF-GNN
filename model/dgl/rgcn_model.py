@@ -38,10 +38,15 @@ class RGCN(nn.Module):
 
         self.decoder = self._internal_decoder_wrapper
 
-        self.casual_decoder = nn.Sequential(
+        self.causal_decoder = nn.Sequential(
             nn.Linear(params.latent_dim // 2, params.emb_dim),
             nn.ReLU(),
             nn.Linear(params.emb_dim, params.emb_dim) # 输出用于计算 aindex
+        )
+        self.shortcut_decoder = nn.Sequential(
+            nn.Linear(params.latent_dim // 2, params.emb_dim),
+            nn.ReLU(),
+            nn.Linear(params.emb_dim, params.emb_dim)
         )
 
         self.mu = None
@@ -76,6 +81,11 @@ class RGCN(nn.Module):
 
         # --- 构建 GraIL 骨干层 ---
         self.build_model()
+
+    @property
+    def casual_decoder(self):
+        # Backward-compatible spelling for older call sites.
+        return self.causal_decoder
 
     def build_model(self):
         self.layers = nn.ModuleList()
@@ -148,7 +158,8 @@ class RGCN(nn.Module):
             mid = z.shape[1] // 2
             alpha = z[:, :mid]
             u, v = g.edges()
-            e_score = torch.sum(alpha[u] * alpha[v], dim=1, keepdim=True)
+            z_causal = self.causal_decoder(alpha)
+            e_score = torch.sum(z_causal[u] * z_causal[v], dim=1, keepdim=True)
             raw_mask = torch.sigmoid(e_score)
             gamma = getattr(self.params, 'current_mask_gamma', getattr(self.params, 'mask_injection_gamma', 0.0))
             effective_mask = 1.0 - gamma + gamma * raw_mask

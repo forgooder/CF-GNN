@@ -38,6 +38,26 @@ def set_random_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
+def apply_causal_mode_defaults(params):
+    """Keep evaluation on the same full causal branch used in training."""
+    if getattr(params, 'causal_mode', 'none') != 'full':
+        return
+
+    params.use_cignn_mask = True
+    params.use_causal_effect_loss = True
+    params.use_mi_loss = True
+    params.use_cmi_loss = True
+    params.cignn_mask_mode = 'both'
+    params.mask_injection_gamma = 1.0
+    params.lambda_effect = 0.5
+    params.lambda_mi = 0.05
+    params.lambda_cmi = 0.05
+    params.lambda_sparse = 0.001
+    params.use_vae_loss = False
+    params.pretrain_vae_only = False
+    params.warmup_epochs = 0
+
+
 def _with_default(params, name, value):
     if not hasattr(params, name) or getattr(params, name) is None:
         setattr(params, name, value)
@@ -57,6 +77,7 @@ def _log_eval_configuration(params):
     )
     logging.info("CIGNN mask enabled: %s", params.use_cignn_mask)
     logging.info("CIGNN mask mode: %s", params.cignn_mask_mode)
+    logging.info("Causal effect loss enabled: %s", params.use_causal_effect_loss)
     logging.info("VAE loss enabled: %s", params.use_vae_loss)
     logging.info("MI loss enabled: %s", params.use_mi_loss)
     logging.info("CMI loss enabled: %s", params.use_cmi_loss)
@@ -93,9 +114,14 @@ def main(params):
     cli_params = vars(params).copy()
     test_dataset = cli_params['dataset']
     train_dataset = cli_params['train_dataset'] or _infer_train_dataset(test_dataset)
-    actual_train_dir = _resolve_train_dir(params.experiment_name, train_dataset, test_dataset)
-    config_path = os.path.join(actual_train_dir, 'params.json')
-    checkpoint_path = os.path.join(actual_train_dir, 'best_model.pth')
+    if cli_params.get('checkpoint'):
+        checkpoint_path = os.path.abspath(cli_params['checkpoint'])
+        actual_train_dir = os.path.dirname(checkpoint_path)
+        config_path = os.path.join(actual_train_dir, 'params.json')
+    else:
+        actual_train_dir = _resolve_train_dir(params.experiment_name, train_dataset, test_dataset)
+        config_path = os.path.join(actual_train_dir, 'params.json')
+        checkpoint_path = os.path.join(actual_train_dir, 'best_model.pth')
     
     if not os.path.exists(config_path):
         raise FileNotFoundError(f'Training params.json not found: {config_path}')
@@ -124,6 +150,11 @@ def main(params):
     params.num_workers = cli_params['num_workers']
     params.batch_size = cli_params['batch_size']
     params.regenerate_test_subgraphs = cli_params['regenerate_test_subgraphs']
+    params.causal_mode = (
+        cli_params['causal_mode']
+        if cli_params['causal_mode'] != 'none'
+        else train_params.get('causal_mode', 'none')
+    )
     params.main_dir = os.getcwd()
     params.exp_dir = actual_train_dir
     params.config_path = config_path
@@ -137,15 +168,24 @@ def main(params):
         'max_links': 1000000, 'max_nodes_per_hop': None,
         'use_kge_embeddings': False, 'kge_model': 'TransE',
         'use_cignn_mask': False, 'use_vae_loss': False,
-        'use_mi_loss': False, 'use_cmi_loss': False,
+        'use_causal_effect_loss': False, 'use_mi_loss': False, 'use_cmi_loss': False,
         'pretrain_vae_only': False, 'load_pretrained_vae': '',
         'freeze_vae_after_pretrain': False, 'cignn_mask_mode': 'none',
         'mask_injection_gamma': 0.0, 'mask_gamma_schedule': 'none',
         'mask_ramp_epochs': 0, 'debug_baseline_check': False,
-        'debug_grad_check': False,
+        'debug_grad_check': False, 'lambda_effect': 0.5,
+        'lambda_sparse': 0.001, 'warmup_epochs': 0,
     }
     for key, value in defaults.items():
         _with_default(params, key, value)
+
+    apply_causal_mode_defaults(params)
+    if getattr(params, 'use_causal_effect_loss', False):
+        if not getattr(params, 'use_cignn_mask', False) or getattr(params, 'cignn_mask_mode', 'none') == 'none':
+            raise RuntimeError(
+                'Causal-effect checkpoint/config requested, but CIGNN mask is disabled. '
+                'Use --causal_mode full or fix params.json.'
+            )
 
     if not hasattr(params, 'num_rels') or params.num_rels is None:
         rels = set()
@@ -220,6 +260,8 @@ if __name__ == '__main__':
     parser.add_argument("--experiment_name", "-e", type=str, default="causal_run")
     parser.add_argument("--dataset", "-d", type=str, required=True)
     parser.add_argument("--train_dataset", type=str, default=None)
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--causal_mode", type=str, choices=['none', 'full'], default='none')
     parser.add_argument("--test_file", "-t", type=str, default="test")
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--seed", type=int, default=1234)

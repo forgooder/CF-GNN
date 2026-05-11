@@ -40,6 +40,28 @@ def set_random_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
+def apply_causal_mode_defaults(params):
+    """Use one switch to enable the full CIGNN-on-GraIL objective."""
+    if getattr(params, 'causal_mode', 'none') != 'full':
+        return
+
+    params.use_cignn_mask = True
+    params.use_causal_effect_loss = True
+    params.use_mi_loss = True
+    params.use_cmi_loss = True
+    params.cignn_mask_mode = 'both'
+    params.mask_injection_gamma = 1.0
+    params.lambda_effect = 0.5
+    params.lambda_mi = 0.05
+    params.lambda_cmi = 0.05
+    params.lambda_sparse = 0.001
+    # Causal full mode learns masks from the prediction/effect objective.
+    # VAE reconstruction is left available as an optional auxiliary loss.
+    params.use_vae_loss = False
+    params.pretrain_vae_only = False
+    params.warmup_epochs = 0
+
+
 def main(params):
     simplefilter(action='ignore', category=UserWarning)
     simplefilter(action='ignore', category=SparseEfficiencyWarning)
@@ -95,6 +117,7 @@ if __name__ == '__main__':
     parser.add_argument("--valid_file", "-vf", type=str, default="valid")
     parser.add_argument("--stage", type=int, default=1, choices=[1, 2])
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--causal_mode", type=str, choices=['none', 'full'], default='none')
     
     # [B. 维度占位符 - 核心修复：注册这些参数，使 initialize_experiment 能够识别并保存它们]
     parser.add_argument("--num_rels", type=int, default=None)
@@ -106,6 +129,8 @@ if __name__ == '__main__':
     parser.add_argument("--lambda_vae", type=float, default=0.5)
     parser.add_argument("--lambda_mi", type=float, default=0.3)
     parser.add_argument("--lambda_cmi", type=float, default=0.1)
+    parser.add_argument("--lambda_effect", type=float, default=0.5)
+    parser.add_argument("--lambda_sparse", type=float, default=0.001)
     parser.add_argument("--latent_dim", type=int, default=64)
     parser.add_argument("--warmup_epochs", type=int, default=50)
     parser.add_argument("--num_epochs", "-ne", type=int, default=150)
@@ -143,6 +168,7 @@ if __name__ == '__main__':
     parser.add_argument('--add_ht_emb', '-ht', type=str2bool, default=True)
     parser.add_argument('--has_attn', '-attn', type=str2bool, default=True)
     parser.add_argument('--use_cignn_mask', type=str2bool, default=False)
+    parser.add_argument('--use_causal_effect_loss', type=str2bool, default=False)
     parser.add_argument('--use_vae_loss', type=str2bool, default=False)
     parser.add_argument('--use_mi_loss', type=str2bool, default=False)
     parser.add_argument('--use_cmi_loss', type=str2bool, default=False)
@@ -159,6 +185,7 @@ if __name__ == '__main__':
     parser.add_argument('--debug_grad_check', type=str2bool, default=False)
 
     params = parser.parse_args()
+    apply_causal_mode_defaults(params)
     set_random_seed(params.seed)
 
     # --- 1. 初始化基础路径 ---

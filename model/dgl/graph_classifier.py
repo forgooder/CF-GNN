@@ -43,6 +43,8 @@ class GraphClassifier(nn.Module):
                 getattr(self.params, 'use_cignn_mask', False)
                 and getattr(self.params, 'cignn_mask_mode', 'none') != 'none'
             )
+            if getattr(self.params, 'use_causal_effect_loss', False) and not use_cignn_mask:
+                raise RuntimeError('Causal-effect inference requires CIGNN mask; refusing baseline fallback.')
             if not use_cignn_mask:
                 return self.forward(data=g, rel_labels=rel_labels)
 
@@ -54,10 +56,14 @@ class GraphClassifier(nn.Module):
             alpha = z[:, :mid]
             beta = z[:, mid:]
 
-            # 调用因果干预函数获取最终 score
-            # k=100 表示测试时使用稳定的干预强度
-            _, scores = joint_uncond(alpha, beta, g, rel_labels, self.gnn.casual_decoder, self, device, k= 50)
-            return scores
+            # 推理只使用 causal branch；shortcut branch 仍参与 effect 建模但不作为最终分数。
+            result = joint_uncond(
+                alpha, beta, g, rel_labels,
+                self.gnn.causal_decoder,
+                self.gnn.shortcut_decoder,
+                self, device, k=50
+            )
+            return result["causal_score"]
 
     def forward(self, data, *args, **kwargs):
         # 兼容性处理：从 args 或 kwargs 中提取 rel_labels 和 edge_weight

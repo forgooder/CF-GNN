@@ -98,6 +98,17 @@ def initialize_model(params, model_class, load_model=False):
             logging.info('Loaded checkpoint is not a dict; using checkpoint.state_dict().')
             state_dict = checkpoint.state_dict()
 
+        remapped_state_dict = {}
+        for key, value in state_dict.items():
+            remapped_key = key.replace('gnn.casual_decoder.', 'gnn.causal_decoder.')
+            remapped_state_dict[remapped_key] = value
+        state_dict = remapped_state_dict
+
+        for key, value in list(state_dict.items()):
+            if key.startswith('gnn.causal_decoder.'):
+                shortcut_key = key.replace('gnn.causal_decoder.', 'gnn.shortcut_decoder.')
+                state_dict.setdefault(shortcut_key, value.clone())
+
         model_state = graph_classifier.state_dict()
         model_keys = set(model_state.keys())
         checkpoint_keys = set(state_dict.keys())
@@ -149,8 +160,18 @@ def load_pretrained_vae_branch(params, graph_classifier):
     else:
         source_state = checkpoint.state_dict()
 
+    remapped_source_state = {}
+    for key, value in source_state.items():
+        remapped_key = key.replace('gnn.casual_decoder.', 'gnn.causal_decoder.')
+        remapped_source_state[remapped_key] = value
+    source_state = remapped_source_state
+    for key, value in list(source_state.items()):
+        if key.startswith('gnn.causal_decoder.'):
+            shortcut_key = key.replace('gnn.causal_decoder.', 'gnn.shortcut_decoder.')
+            source_state.setdefault(shortcut_key, value.clone())
+
     model_state = graph_classifier.state_dict()
-    branch_prefixes = ('gnn.encoder.', 'gnn.casual_decoder.')
+    branch_prefixes = ('gnn.encoder.', 'gnn.causal_decoder.', 'gnn.shortcut_decoder.')
     expected_keys = sorted([
         key for key in model_state
         if key.startswith(branch_prefixes)
@@ -197,7 +218,9 @@ def load_pretrained_vae_branch(params, graph_classifier):
     if getattr(params, 'freeze_vae_after_pretrain', False):
         for parameter in graph_classifier.gnn.encoder.parameters():
             parameter.requires_grad = False
-        for parameter in graph_classifier.gnn.casual_decoder.parameters():
+        for parameter in graph_classifier.gnn.causal_decoder.parameters():
+            parameter.requires_grad = False
+        for parameter in graph_classifier.gnn.shortcut_decoder.parameters():
             parameter.requires_grad = False
         logging.info("Pretrained VAE/mask branch frozen.")
     else:

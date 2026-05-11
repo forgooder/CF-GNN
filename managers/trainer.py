@@ -44,9 +44,11 @@ class Trainer():
 
         logging.info(
             "Training modes: use_cignn_mask=%s, cignn_mask_mode=%s, "
-            "use_vae_loss=%s, use_mi_loss=%s, use_cmi_loss=%s, pretrain_vae_only=%s",
+            "use_causal_effect_loss=%s, use_vae_loss=%s, use_mi_loss=%s, "
+            "use_cmi_loss=%s, pretrain_vae_only=%s",
             getattr(self.params, 'use_cignn_mask', False),
             getattr(self.params, 'cignn_mask_mode', 'none'),
+            getattr(self.params, 'use_causal_effect_loss', False),
             getattr(self.params, 'use_vae_loss', False),
             getattr(self.params, 'use_mi_loss', False),
             getattr(self.params, 'use_cmi_loss', False),
@@ -62,9 +64,11 @@ class Trainer():
             logging.info(f'Starting Epoch {epoch}')
             logging.info(
                 "Epoch mode: use_cignn_mask=%s, cignn_mask_mode=%s, "
-                "use_vae_loss=%s, use_mi_loss=%s, use_cmi_loss=%s, components=%s",
+                "use_causal_effect_loss=%s, use_vae_loss=%s, use_mi_loss=%s, "
+                "use_cmi_loss=%s, components=%s",
                 getattr(self.params, 'use_cignn_mask', False),
                 getattr(self.params, 'cignn_mask_mode', 'none'),
+                getattr(self.params, 'use_causal_effect_loss', False),
                 getattr(self.params, 'use_vae_loss', False),
                 getattr(self.params, 'use_mi_loss', False),
                 getattr(self.params, 'use_cmi_loss', False),
@@ -107,8 +111,10 @@ class Trainer():
                     tepoch.set_postfix(
                         L_tot=f"{metrics['total']:.3f}",
                         Task=f"{metrics['task']:.3f}",
+                        Eff=f"{metrics.get('effect', 0.0):.3f}",
                         MI=f"{metrics['mi']:.4f}",
                         Mask=f"{metrics['aedge']:.3f}",
+                        Sp=f"{metrics.get('sparse', 0.0):.4f}",
                         Adj=f"{metrics['recon_adj']:.4f}"
                     )
 
@@ -140,8 +146,11 @@ class Trainer():
         if model_part == 'vae_mask':
             for p in self.graph_classifier.gnn.encoder.parameters():
                 p.requires_grad = requires_grad
-            if hasattr(self.graph_classifier.gnn, 'casual_decoder'):
-                for p in self.graph_classifier.gnn.casual_decoder.parameters():
+            if hasattr(self.graph_classifier.gnn, 'causal_decoder'):
+                for p in self.graph_classifier.gnn.causal_decoder.parameters():
+                    p.requires_grad = requires_grad
+            if hasattr(self.graph_classifier.gnn, 'shortcut_decoder'):
+                for p in self.graph_classifier.gnn.shortcut_decoder.parameters():
                     p.requires_grad = requires_grad
             return
 
@@ -212,31 +221,47 @@ class Trainer():
             and getattr(self.params, 'cignn_mask_mode', 'none') != 'none'
         )
         if use_mask:
-            causal_pos, pos_scores = joint_uncond(
+            pos_result = joint_uncond(
                 pos_pack['alpha'], pos_pack['beta'], pos_pack['g'], pos_pack['rel_labels'],
-                self.graph_classifier.gnn.casual_decoder,
+                self.graph_classifier.gnn.causal_decoder,
+                self.graph_classifier.gnn.shortcut_decoder,
                 self.graph_classifier,
                 self.params.device,
                 k=epoch,
                 compute_cmi=False
             )
-            causal_neg, neg_scores = joint_uncond(
+            neg_result = joint_uncond(
                 neg_pack['alpha'], neg_pack['beta'], neg_pack['g'], neg_pack['rel_labels'],
-                self.graph_classifier.gnn.casual_decoder,
+                self.graph_classifier.gnn.causal_decoder,
+                self.graph_classifier.gnn.shortcut_decoder,
                 self.graph_classifier,
                 self.params.device,
                 k=epoch,
                 compute_cmi=False
             )
-            causal_val = 0.5 * (causal_pos + causal_neg)
+            pos_scores = pos_result['causal_score']
+            neg_scores = neg_result['causal_score']
+            pos_effect = pos_result['causal_effect'].view(-1)
+            neg_effect = neg_result['causal_effect'].view(-1)
         else:
+            if getattr(self.params, 'use_causal_effect_loss', False):
+                raise RuntimeError('use_causal_effect_loss=true requires use_cignn_mask=true and cignn_mask_mode != none.')
             pos_scores = self.graph_classifier(data=pos_pack['g'], rel_labels=pos_pack['rel_labels'])
             neg_scores = self.graph_classifier(data=neg_pack['g'], rel_labels=neg_pack['rel_labels'])
-            causal_val = zero
+            pos_result = None
+            neg_result = None
+            pos_effect = None
+            neg_effect = None
 
         pos_scores = pos_scores.view(-1)
         neg_scores = neg_scores.view(-1)
         loss_task = self._compute_task_loss(pos_scores, neg_scores)
+
+        loss_effect = zero
+        if getattr(self.params, 'use_causal_effect_loss', False):
+            # The causal effect itself is ranked: positive triples should have
+            # a larger causal-minus-shortcut score than negative triples.
+            loss_effect = self._compute_task_loss(pos_effect, neg_effect)
 
         loss_mi = zero
         if getattr(self.params, 'use_mi_loss', False):
@@ -254,25 +279,27 @@ class Trainer():
             ], dim=0)
             loss_cmi = calculate_conditional_MI(graph_alpha, y_float, graph_beta)
 
-        if self._warmup_active(epoch):
-            total_loss = 0.1 * loss_task
-            if getattr(self.params, 'use_vae_loss', False):
-                total_loss = total_loss + self.params.lambda_vae * vae_loss
-            if getattr(self.params, 'use_mi_loss', False):
-                total_loss = total_loss + self.params.lambda_mi * loss_mi
-            if getattr(self.params, 'use_cmi_loss', False):
-                total_loss = total_loss - self.params.lambda_cmi * loss_cmi
-        else:
-            total_loss = loss_task
-            if getattr(self.params, 'use_vae_loss', False):
-                total_loss = total_loss + 0.1 * vae_loss
-            if getattr(self.params, 'use_mi_loss', False):
-                total_loss = total_loss + self.params.lambda_mi * loss_mi
-            if getattr(self.params, 'use_cmi_loss', False):
-                total_loss = total_loss - self.params.lambda_cmi * loss_cmi
+        loss_sparse = zero
+        if use_mask:
+            loss_sparse = torch.cat([
+                pos_result['mask_alpha'].view(-1),
+                neg_result['mask_alpha'].view(-1)
+            ], dim=0).mean()
 
-        mask_log = self._log_mask_stats(pos_pack['g'], neg_pack['g']) if use_mask else None
-        aedge_mean = mask_log['raw']['mean'] if mask_log else 0.0
+        total_loss = loss_task
+        if getattr(self.params, 'use_causal_effect_loss', False):
+            total_loss = total_loss + getattr(self.params, 'lambda_effect', 0.5) * loss_effect
+        if getattr(self.params, 'use_vae_loss', False):
+            total_loss = total_loss + self.params.lambda_vae * vae_loss
+        if getattr(self.params, 'use_mi_loss', False):
+            total_loss = total_loss + self.params.lambda_mi * loss_mi
+        if getattr(self.params, 'use_cmi_loss', False):
+            total_loss = total_loss - self.params.lambda_cmi * loss_cmi
+        if use_mask:
+            total_loss = total_loss + getattr(self.params, 'lambda_sparse', 0.001) * loss_sparse
+
+        mask_log = self._log_causal_result_stats(pos_result, neg_result) if use_mask else None
+        aedge_mean = mask_log['alpha']['mean'] if mask_log else 0.0
 
         total_loss.backward()
         self._log_grad_debug_if_needed(
@@ -291,6 +318,8 @@ class Trainer():
             'aedge': aedge_mean,
             'recon_adj': loss_recon_adj.item(),
             'task': loss_task.item(),
+            'effect': loss_effect.item(),
+            'sparse': loss_sparse.item(),
             'components': ",".join(self._loss_component_names())
         }
 
@@ -393,6 +422,7 @@ class Trainer():
     def _auxiliary_enabled(self):
         return (
             getattr(self.params, 'use_cignn_mask', False)
+            or getattr(self.params, 'use_causal_effect_loss', False)
             or getattr(self.params, 'use_vae_loss', False)
             or getattr(self.params, 'use_mi_loss', False)
             or getattr(self.params, 'use_cmi_loss', False)
@@ -404,6 +434,8 @@ class Trainer():
 
     def _warmup_active(self, epoch):
         if getattr(self.params, 'pretrain_vae_only', False):
+            return False
+        if getattr(self.params, 'use_causal_effect_loss', False):
             return False
         if not self._auxiliary_enabled():
             return False
@@ -455,6 +487,9 @@ class Trainer():
             components.append('mi')
         if getattr(self.params, 'use_cmi_loss', False):
             components.append('cmi')
+        if getattr(self.params, 'use_causal_effect_loss', False):
+            components.append('causal_effect_rank')
+            components.append('sparse')
         if (
             getattr(self.params, 'use_cignn_mask', False)
             and getattr(self.params, 'cignn_mask_mode', 'none') != 'none'
@@ -464,7 +499,7 @@ class Trainer():
 
     def _compute_raw_mask(self, g, alpha):
         u, v = g.edges()
-        z_causal = self.graph_classifier.gnn.casual_decoder(alpha)
+        z_causal = self.graph_classifier.gnn.causal_decoder(alpha)
         mask_logits = torch.sum(z_causal[u] * z_causal[v], dim=1)
         return torch.sigmoid(mask_logits).view(-1, 1)
 
@@ -522,6 +557,42 @@ class Trainer():
         )
         return {'raw': raw_stats, 'effective': effective_stats}
 
+    def _log_causal_result_stats(self, pos_result, neg_result):
+        if pos_result is None or neg_result is None:
+            raise RuntimeError('CIGNN mask was enabled but causal result tensors were not generated.')
+
+        alpha_mask = torch.cat([
+            pos_result['mask_alpha'].view(-1, 1),
+            neg_result['mask_alpha'].view(-1, 1)
+        ], dim=0)
+        beta_mask = torch.cat([
+            pos_result['mask_beta'].view(-1, 1),
+            neg_result['mask_beta'].view(-1, 1)
+        ], dim=0)
+        effect = torch.cat([
+            pos_result['causal_effect'].view(-1, 1),
+            neg_result['causal_effect'].view(-1, 1)
+        ], dim=0)
+
+        alpha_stats = self._tensor_stats(alpha_mask)
+        beta_stats = self._tensor_stats(beta_mask)
+        effect_stats = self._tensor_stats(effect)
+        logging.info(
+            "Causal branch stats: mode=%s gamma=%.6f "
+            "alpha_mask_mean=%.6f alpha_mask_std=%.6f "
+            "beta_mask_mean=%.6f beta_mask_std=%.6f "
+            "effect_mean=%.6f effect_std=%.6f",
+            getattr(self.params, 'cignn_mask_mode', 'none'),
+            getattr(self.params, 'current_mask_gamma', 0.0),
+            alpha_stats['mean'],
+            alpha_stats['std'],
+            beta_stats['mean'],
+            beta_stats['std'],
+            effect_stats['mean'],
+            effect_stats['std'],
+        )
+        return {'alpha': alpha_stats, 'beta': beta_stats, 'effect': effect_stats}
+
     def _grad_norm(self, parameters):
         total = 0.0
         has_grad = False
@@ -547,7 +618,8 @@ class Trainer():
             predictor_params += list(self.graph_classifier.gnn.attn_rel_emb.parameters())
 
         encoder_grad_norm = self._grad_norm(self.graph_classifier.gnn.encoder.parameters())
-        decoder_grad_norm = self._grad_norm(self.graph_classifier.gnn.casual_decoder.parameters())
+        causal_decoder_grad_norm = self._grad_norm(self.graph_classifier.gnn.causal_decoder.parameters())
+        shortcut_decoder_grad_norm = self._grad_norm(self.graph_classifier.gnn.shortcut_decoder.parameters())
         predictor_grad_norm = self._grad_norm(predictor_params)
 
         mask_logits = getattr(g_pos, 'mask_logits_ref', None)
@@ -558,7 +630,8 @@ class Trainer():
         logging.info("Gradient sanity check epoch %s:", epoch)
         logging.info("  GraIL predictor grad norm: %s", predictor_grad_norm)
         logging.info("  VAE/mask encoder grad norm: %s", encoder_grad_norm)
-        logging.info("  VAE/mask decoder grad norm: %s", decoder_grad_norm)
+        logging.info("  causal decoder grad norm: %s", causal_decoder_grad_norm)
+        logging.info("  shortcut decoder grad norm: %s", shortcut_decoder_grad_norm)
         logging.info("  mask_logits.requires_grad: %s", bool(mask_logits.requires_grad) if mask_logits is not None else False)
         logging.info("  raw_mask.requires_grad: %s", bool(raw_mask.requires_grad) if raw_mask is not None else False)
         logging.info("  effective_mask.requires_grad: %s", bool(effective_mask.requires_grad) if effective_mask is not None else False)
@@ -573,7 +646,10 @@ class Trainer():
             logging.info("CIGNN mask disabled; VAE/mask branch is not in GraIL message passing.")
         elif gamma > 0:
             encoder_missing = encoder_grad_norm is None or encoder_grad_norm == 0.0
-            decoder_missing = decoder_grad_norm is None or decoder_grad_norm == 0.0
+            decoder_missing = (
+                causal_decoder_grad_norm is None or causal_decoder_grad_norm == 0.0
+                or shortcut_decoder_grad_norm is None or shortcut_decoder_grad_norm == 0.0
+            )
             if encoder_missing or decoder_missing:
                 logging.warning("WARNING: VAE/mask branch receives no gradient from prediction loss.")
 
@@ -629,6 +705,7 @@ class Trainer():
         logging.info("Baseline debug check:")
         logging.info("  use_cignn_mask: %s", getattr(self.params, 'use_cignn_mask', False))
         logging.info("  cignn_mask_mode: %s", getattr(self.params, 'cignn_mask_mode', 'none'))
+        logging.info("  use_causal_effect_loss: %s", getattr(self.params, 'use_causal_effect_loss', False))
         logging.info("  use_vae_loss: %s", getattr(self.params, 'use_vae_loss', False))
         logging.info("  use_mi_loss: %s", getattr(self.params, 'use_mi_loss', False))
         logging.info("  use_cmi_loss: %s", getattr(self.params, 'use_cmi_loss', False))
@@ -721,6 +798,7 @@ class Trainer():
             'best_val_metric': metric,
             'params': self._checkpoint_params(),
             'use_cignn_mask': getattr(self.params, 'use_cignn_mask', False),
+            'use_causal_effect_loss': getattr(self.params, 'use_causal_effect_loss', False),
             'cignn_mask_mode': getattr(self.params, 'cignn_mask_mode', 'none'),
             'gamma': getattr(self.params, 'current_mask_gamma', getattr(self.params, 'mask_injection_gamma', 0.0)),
             'is_full_prediction_model': is_full_prediction_model,
@@ -739,7 +817,7 @@ class Trainer():
 
     def save_vae_pretrain(self, epoch=None, metric=None):
         checkpoint_path = os.path.join(self.params.exp_dir, 'vae_pretrain.pth')
-        branch_prefixes = ('gnn.encoder.', 'gnn.casual_decoder.')
+        branch_prefixes = ('gnn.encoder.', 'gnn.causal_decoder.', 'gnn.shortcut_decoder.')
         branch_state = {
             key: value for key, value in self.graph_classifier.state_dict().items()
             if key.startswith(branch_prefixes)
