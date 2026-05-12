@@ -4,6 +4,7 @@ import argparse
 import logging
 import json
 import time
+import hashlib
 
 import multiprocessing as mp
 import scipy.sparse as ssp
@@ -12,6 +13,201 @@ import networkx as nx
 import torch
 import numpy as np
 import dgl
+
+from model.dgl.graph_classifier import GraphClassifier
+from utils.initialization_utils import initialize_model
+
+
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in ('yes', 'true', 't', '1', 'y'):
+        return True
+    if value in ('no', 'false', 'f', '0', 'n'):
+        return False
+    raise argparse.ArgumentTypeError('Boolean value expected.')
+
+
+def set_random_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def apply_causal_mode_defaults(params, force=True):
+    if getattr(params, 'causal_mode', 'none') != 'full':
+        return
+
+    def set_default(name, value, baseline=None):
+        current = getattr(params, name, None)
+        if force or current is None or current == baseline:
+            setattr(params, name, value)
+
+    set_default('use_cignn_mask', True, False)
+    set_default('use_causal_effect_loss', True, False)
+    set_default('use_vae_loss', True, False)
+    set_default('use_mi_loss', True, False)
+    set_default('use_cmi_loss', True, False)
+    set_default('cignn_mask_mode', 'attention_only', 'none')
+    set_default('mask_injection_gamma', 1.0, 0.0)
+    set_default('mask_gamma_schedule', 'linear', 'none')
+    set_default('mask_ramp_epochs', max(getattr(params, 'mask_ramp_epochs', 0), 10), 0)
+    set_default('lambda_effect', 0.5)
+    set_default('lambda_vae', 0.1)
+    set_default('lambda_mi', 0.05)
+    set_default('lambda_cmi', 0.05)
+    set_default('lambda_sparse', 0.001)
+    set_default('pretrain_vae_only', False, True)
+    set_default('warmup_epochs', max(getattr(params, 'warmup_epochs', 0), 50), 0)
+
+
+def _with_default(params, name, value):
+    if not hasattr(params, name) or getattr(params, name) is None:
+        setattr(params, name, value)
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _infer_train_dataset(test_dataset):
+    return test_dataset[:-4] if test_dataset.endswith('_ind') else test_dataset
+
+
+def _resolve_train_dir(experiment_name, train_dataset, test_dataset):
+    candidates = [
+        os.path.join(os.getcwd(), 'experiments', experiment_name, f'{train_dataset}_exp'),
+        os.path.join(os.getcwd(), 'experiments', experiment_name, f'{test_dataset}_exp'),
+        os.path.join(os.getcwd(), 'experiments', experiment_name),
+    ]
+    for candidate in candidates:
+        if os.path.exists(os.path.join(candidate, 'params.json')):
+            return candidate
+    return candidates[0]
+
+
+def _infer_relation_count(params):
+    relation2id_path = os.path.join(params.main_dir, f'data/{params.train_dataset}/relation2id.json')
+    if os.path.exists(relation2id_path):
+        with open(relation2id_path) as f:
+            return len(json.load(f))
+
+    rels = set()
+    for split in ('train', 'valid'):
+        path = os.path.join(params.main_dir, f'data/{params.train_dataset}/{split}.txt')
+        if not os.path.exists(path):
+            continue
+        with open(path, 'r') as f:
+            for line in f:
+                parts = line.strip().split('\t')
+                if len(parts) == 3:
+                    rels.add(parts[1])
+    return len(rels)
+
+
+def _normalize_max_label(max_label_value, hop):
+    if isinstance(max_label_value, (list, tuple, np.ndarray)):
+        if len(max_label_value) >= 2:
+            return [int(max_label_value[0]), int(max_label_value[1])]
+        if len(max_label_value) == 1:
+            value = int(max_label_value[0])
+            return [value, value]
+    if max_label_value is None:
+        value = int(hop)
+    else:
+        value = int(max_label_value)
+    return [value, value]
+
+
+def _load_training_config(params):
+    cli_params = vars(params).copy()
+    test_dataset = cli_params['dataset']
+    train_dataset = cli_params['train_dataset'] or _infer_train_dataset(test_dataset)
+    if cli_params.get('checkpoint'):
+        checkpoint_path = os.path.abspath(cli_params['checkpoint'])
+        train_dir = os.path.dirname(checkpoint_path)
+        config_path = os.path.join(train_dir, 'params.json')
+    else:
+        train_dir = _resolve_train_dir(params.experiment_name, train_dataset, test_dataset)
+        config_path = os.path.join(train_dir, 'params.json')
+        checkpoint_path = os.path.join(train_dir, 'best_model.pth')
+
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f'Training params.json not found: {config_path}')
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f'Model checkpoint not found: {checkpoint_path}')
+
+    before_params_hash = _file_sha256(config_path)
+    with open(config_path, 'r') as f:
+        train_params = json.load(f)
+
+    for key, value in train_params.items():
+        if key not in {'exp_dir', 'device', 'collate_fn', 'move_batch_to_device'}:
+            setattr(params, key, value)
+
+    params.train_dataset = train_params.get('dataset', train_dataset)
+    params.test_dataset = test_dataset
+    params.dataset = params.train_dataset
+    params.experiment_name = cli_params['experiment_name']
+    params.checkpoint_path = checkpoint_path
+    params.config_path = config_path
+    params.exp_dir = train_dir
+    params.main_dir = os.getcwd()
+    params.mode = cli_params['mode']
+    params.runs = cli_params['runs']
+    params.seed = cli_params['seed']
+    params.gpu = cli_params['gpu']
+    params.disable_cuda = cli_params['disable_cuda']
+    params.num_workers = cli_params['num_workers']
+    params.batch_size = cli_params['batch_size']
+    params.test_file = cli_params['test_file']
+    params.causal_mode = (
+        cli_params['causal_mode']
+        if cli_params['causal_mode'] != 'none'
+        else train_params.get('causal_mode', 'none')
+    )
+
+    defaults = {
+        'emb_dim': 64, 'latent_dim': 64, 'rel_emb_dim': 64,
+        'attn_rel_emb_dim': 64, 'num_gcn_layers': 3, 'num_bases': 4,
+        'dropout': 0, 'edge_dropout': 0.5, 'gnn_agg_type': 'sum',
+        'has_attn': True, 'add_ht_emb': True, 'inp_dim': 2 * (params.hop + 1),
+        'stage': 1, 'max_links': 1000000, 'max_nodes_per_hop': None,
+        'use_kge_embeddings': False, 'kge_model': 'TransE',
+        'use_cignn_mask': False, 'use_vae_loss': False,
+        'use_causal_effect_loss': False, 'use_mi_loss': False, 'use_cmi_loss': False,
+        'pretrain_vae_only': False, 'load_pretrained_vae': '',
+        'freeze_vae_after_pretrain': False, 'cignn_mask_mode': 'none',
+        'mask_injection_gamma': 0.0, 'mask_gamma_schedule': 'none',
+        'mask_ramp_epochs': 0, 'debug_baseline_check': False,
+        'debug_grad_check': False, 'lambda_effect': 0.5,
+        'lambda_sparse': 0.001, 'warmup_epochs': 0,
+    }
+    for key, value in defaults.items():
+        _with_default(params, key, value)
+
+    apply_causal_mode_defaults(params, force=cli_params['causal_mode'] == 'full')
+    if getattr(params, 'use_causal_effect_loss', False):
+        if not getattr(params, 'use_cignn_mask', False) or getattr(params, 'cignn_mask_mode', 'none') == 'none':
+            raise RuntimeError('Causal-effect ranking requires CIGNN mask. Use --causal_mode full or fix params.json.')
+
+    if not hasattr(params, 'num_rels') or params.num_rels is None:
+        params.num_rels = _infer_relation_count(params)
+        params.aug_num_rels = params.num_rels * (2 if params.add_traspose_rels else 1)
+    if not hasattr(params, 'max_label_value') or params.max_label_value is None:
+        params.max_label_value = params.hop
+    params.max_label_value = _normalize_max_label(params.max_label_value, params.hop)
+
+    return before_params_hash
 
 
 def process_files(files, saved_relation2id, add_traspose_rels):
@@ -341,7 +537,15 @@ def get_subgraphs(all_links, adj_list, dgl_adj_list, max_node_label_value, id2en
 
     for link in all_links:
         head, tail, rel = link[0], link[1], link[2]
-        nodes, node_labels = subgraph_extraction_labeling((head, tail), rel, adj_list, h=params_.hop, enclosing_sub_graph=params.enclosing_sub_graph, max_node_label_value=max_node_label_value)
+        nodes, node_labels = subgraph_extraction_labeling(
+            (head, tail),
+            rel,
+            adj_list,
+            h=params_.hop,
+            enclosing_sub_graph=params_.enclosing_sub_graph,
+            max_nodes_per_hop=getattr(params_, 'max_nodes_per_hop', None),
+            max_node_label_value=max_node_label_value
+        )
 
         subgraph = dgl.DGLGraph(dgl_adj_list.subgraph(nodes))
         subgraph.edata['type'] = dgl_adj_list.edata['type'][dgl_adj_list.subgraph(nodes).parent_eid]
@@ -375,8 +579,9 @@ def get_rank(neg_links):
 
     if head_target_id != 10000:
         data = get_subgraphs(head_neg_links, adj_list_, dgl_adj_list_, model_.gnn.max_label_value, id2entity_, node_features_, kge_entity2id_)
-        head_scores = model_(data).squeeze(1).detach().numpy()
-        head_rank = np.argwhere(np.argsort(head_scores)[::-1] == head_target_id) + 1
+        with torch.no_grad():
+            head_scores = model_.predict(data, params_.device).squeeze(1).detach().cpu().numpy()
+        head_rank = int(np.argwhere(np.argsort(head_scores)[::-1] == head_target_id)[0][0] + 1)
     else:
         head_scores = np.array([])
         head_rank = 10000
@@ -386,8 +591,9 @@ def get_rank(neg_links):
 
     if tail_target_id != 10000:
         data = get_subgraphs(tail_neg_links, adj_list_, dgl_adj_list_, model_.gnn.max_label_value, id2entity_, node_features_, kge_entity2id_)
-        tail_scores = model_(data).squeeze(1).detach().numpy()
-        tail_rank = np.argwhere(np.argsort(tail_scores)[::-1] == tail_target_id) + 1
+        with torch.no_grad():
+            tail_scores = model_.predict(data, params_.device).squeeze(1).detach().cpu().numpy()
+        tail_rank = int(np.argwhere(np.argsort(tail_scores)[::-1] == tail_target_id)[0][0] + 1)
     else:
         tail_scores = np.array([])
         tail_rank = 10000
@@ -411,27 +617,39 @@ def save_to_file(neg_triplets, id2entity, id2relation):
 def save_score_to_file(neg_triplets, all_head_scores, all_tail_scores, id2entity, id2relation):
 
     with open(os.path.join('./data', params.dataset, 'grail_ranking_head_predictions.txt'), "w") as f:
+        offset = 0
         for i, neg_triplet in enumerate(neg_triplets):
-            for [s, o, r], head_score in zip(neg_triplet['head'][0], all_head_scores[50 * i:50 * (i + 1)]):
+            next_offset = offset + len(neg_triplet['head'][0])
+            for [s, o, r], head_score in zip(neg_triplet['head'][0], all_head_scores[offset:next_offset]):
                 f.write('\t'.join([id2entity[s], id2relation[r], id2entity[o], str(head_score)]) + '\n')
+            offset = next_offset
 
     with open(os.path.join('./data', params.dataset, 'grail_ranking_tail_predictions.txt'), "w") as f:
+        offset = 0
         for i, neg_triplet in enumerate(neg_triplets):
-            for [s, o, r], tail_score in zip(neg_triplet['tail'][0], all_tail_scores[50 * i:50 * (i + 1)]):
+            next_offset = offset + len(neg_triplet['tail'][0])
+            for [s, o, r], tail_score in zip(neg_triplet['tail'][0], all_tail_scores[offset:next_offset]):
                 f.write('\t'.join([id2entity[s], id2relation[r], id2entity[o], str(tail_score)]) + '\n')
+            offset = next_offset
 
 
 def save_score_to_file_from_ruleN(neg_triplets, all_head_scores, all_tail_scores, id2entity, id2relation):
 
     with open(os.path.join('./data', params.dataset, 'grail_ruleN_ranking_head_predictions.txt'), "w") as f:
+        offset = 0
         for i, neg_triplet in enumerate(neg_triplets):
-            for [s, o, r], head_score in zip(neg_triplet['head'][0], all_head_scores[50 * i:50 * (i + 1)]):
+            next_offset = offset + len(neg_triplet['head'][0])
+            for [s, o, r], head_score in zip(neg_triplet['head'][0], all_head_scores[offset:next_offset]):
                 f.write('\t'.join([id2entity[s], id2relation[r], id2entity[o], str(head_score)]) + '\n')
+            offset = next_offset
 
     with open(os.path.join('./data', params.dataset, 'grail_ruleN_ranking_tail_predictions.txt'), "w") as f:
+        offset = 0
         for i, neg_triplet in enumerate(neg_triplets):
-            for [s, o, r], tail_score in zip(neg_triplet['tail'][0], all_tail_scores[50 * i:50 * (i + 1)]):
+            next_offset = offset + len(neg_triplet['tail'][0])
+            for [s, o, r], tail_score in zip(neg_triplet['tail'][0], all_tail_scores[offset:next_offset]):
                 f.write('\t'.join([id2entity[s], id2relation[r], id2entity[o], str(tail_score)]) + '\n')
+            offset = next_offset
 
 
 def get_kge_embeddings(dataset, kge_model):
@@ -446,9 +664,35 @@ def get_kge_embeddings(dataset, kge_model):
 
 
 def main(params):
-    model = torch.load(params.model_path, map_location='cpu')
+    before_params_hash = _load_training_config(params)
+    params.device = torch.device(
+        f'cuda:{params.gpu}'
+        if not params.disable_cuda and torch.cuda.is_available()
+        else 'cpu'
+    )
 
-    adj_list, dgl_adj_list, triplets, entity2id, relation2id, id2entity, id2relation = process_files(params.file_paths, model.relation2id, params.add_traspose_rels)
+    logging.info("Loaded params.json: %s", params.config_path)
+    logging.info("Checkpoint path: %s", params.checkpoint_path)
+    logging.info("Train dataset: %s", params.train_dataset)
+    logging.info("Ranking dataset: %s", params.test_dataset)
+    logging.info("CIGNN mask enabled: %s", getattr(params, 'use_cignn_mask', False))
+    logging.info("CIGNN mask mode: %s", getattr(params, 'cignn_mask_mode', 'none'))
+    logging.info("Causal effect loss enabled: %s", getattr(params, 'use_causal_effect_loss', False))
+
+    model = initialize_model(params, GraphClassifier, load_model=True)
+    model.eval()
+
+    params.dataset = params.test_dataset
+    params.file_paths = {
+        'graph': os.path.join(params.main_dir, 'data', params.test_dataset, 'train.txt'),
+        'links': os.path.join(params.main_dir, 'data', params.test_dataset, params.test_file + '.txt')
+    }
+
+    adj_list, dgl_adj_list, triplets, entity2id, relation2id, id2entity, id2relation = process_files(
+        params.file_paths,
+        model.relation2id,
+        params.add_traspose_rels
+    )
 
     node_features, kge_entity2id = get_kge_embeddings(params.dataset, params.kge_model) if params.use_kge_embeddings else (None, None)
 
@@ -463,22 +707,25 @@ def main(params):
     ranks = []
     all_head_scores = []
     all_tail_scores = []
-    with mp.Pool(processes=None, initializer=intialize_worker, initargs=(model, adj_list, dgl_adj_list, id2entity, params, node_features, kge_entity2id)) as p:
-        for head_scores, head_rank, tail_scores, tail_rank in tqdm(p.imap(get_rank, neg_triplets), total=len(neg_triplets)):
+
+    def consume_rank_results(results_iter):
+        for head_scores, head_rank, tail_scores, tail_rank in tqdm(results_iter, total=len(neg_triplets)):
             ranks.append(head_rank)
             ranks.append(tail_rank)
 
             all_head_scores += head_scores.tolist()
             all_tail_scores += tail_scores.tolist()
 
-    # intialize_worker(model, adj_list, dgl_adj_list, id2entity, params, node_features, kge_entity2id)
-    # for link in tqdm(neg_triplets, total=len(neg_triplets)):
-    #     head_scores, head_rank, tail_scores, tail_rank = get_rank(link)
-    #     ranks.append(head_rank)
-    #     ranks.append(tail_rank)
-
-    #     all_head_scores += head_scores.tolist()
-    #     all_tail_scores += tail_scores.tolist()
+    if params.num_workers > 0 and params.device.type == 'cpu':
+        with mp.Pool(
+            processes=params.num_workers,
+            initializer=intialize_worker,
+            initargs=(model, adj_list, dgl_adj_list, id2entity, params, node_features, kge_entity2id)
+        ) as p:
+            consume_rank_results(p.imap(get_rank, neg_triplets))
+    else:
+        intialize_worker(model, adj_list, dgl_adj_list, id2entity, params, node_features, kge_entity2id)
+        consume_rank_results(map(get_rank, neg_triplets))
 
     if params.mode == 'ruleN':
         save_score_to_file_from_ruleN(neg_triplets, all_head_scores, all_tail_scores, id2entity, id2relation)
@@ -496,6 +743,14 @@ def main(params):
 
     logger.info(f'MRR | Hits@1 | Hits@5 | Hits@10 : {mrr} | {hits_1} | {hits_5} | {hits_10}')
 
+    after_params_hash = _file_sha256(params.config_path)
+    logger.info("Before ranking params hash: %s", before_params_hash)
+    logger.info("After ranking params hash: %s", after_params_hash)
+    if after_params_hash != before_params_hash:
+        raise RuntimeError(
+            f'params.json changed during ranking: before={before_params_hash}, after={after_params_hash}'
+        )
+
 
 if __name__ == '__main__':
 
@@ -508,30 +763,45 @@ if __name__ == '__main__':
                         help="Experiment name. Log file with this name will be created")
     parser.add_argument("--dataset", "-d", type=str, default="FB237_v2",
                         help="Path to dataset")
+    parser.add_argument("--train_dataset", type=str, default=None)
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--causal_mode", type=str, choices=['none', 'full'], default='none')
+    parser.add_argument("--test_file", "-t", type=str, default="test")
+    parser.add_argument("--runs", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument('--disable_cuda', action='store_true')
+    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--mode", "-m", type=str, default="sample", choices=["sample", "all", "ruleN"],
                         help="Negative sampling mode")
-    parser.add_argument("--use_kge_embeddings", "-kge", type=bool, default=False,
+    parser.add_argument("--use_kge_embeddings", "-kge", type=str2bool, default=False,
                         help='whether to use pretrained KGE embeddings')
     parser.add_argument("--kge_model", type=str, default="TransE",
                         help="Which KGE model to load entity embeddings from")
-    parser.add_argument('--enclosing_sub_graph', '-en', type=bool, default=True,
+    parser.add_argument('--enclosing_sub_graph', '-en', type=str2bool, default=True,
                         help='whether to only consider enclosing subgraph')
     parser.add_argument("--hop", type=int, default=3,
                         help="How many hops to go while eextracting subgraphs?")
-    parser.add_argument('--add_traspose_rels', '-tr', type=bool, default=False,
+    parser.add_argument("--max_nodes_per_hop", "-max_h", type=int, default=None)
+    parser.add_argument('--add_traspose_rels', '-tr', type=str2bool, default=False,
                         help='Whether to append adj matrix list with symmetric relations?')
 
     params = parser.parse_args()
+    set_random_seed(params.seed)
+    params.main_dir = os.getcwd()
+    params.ruleN_pred_path = os.path.join(params.main_dir, 'data', params.dataset, 'pos_predictions.txt')
 
-    params.file_paths = {
-        'graph': os.path.join('./data', params.dataset, 'train.txt'),
-        'links': os.path.join('./data', params.dataset, 'test.txt')
-    }
-
-    params.ruleN_pred_path = os.path.join('./data', params.dataset, 'pos_predictions.txt')
-    params.model_path = os.path.join('experiments', params.experiment_name, 'best_graph_classifier.pth')
-
-    file_handler = logging.FileHandler(os.path.join('experiments', params.experiment_name, f'log_rank_test_{time.time()}.txt'))
+    train_dataset = params.train_dataset or _infer_train_dataset(params.dataset)
+    train_dir = (
+        os.path.dirname(os.path.abspath(params.checkpoint))
+        if params.checkpoint
+        else _resolve_train_dir(params.experiment_name, train_dataset, params.dataset)
+    )
+    rank_log_dir = os.path.join(train_dir, f"rank_{params.dataset}")
+    if not os.path.exists(rank_log_dir):
+        os.makedirs(rank_log_dir)
+    file_handler = logging.FileHandler(os.path.join(rank_log_dir, f'log_rank_test_{time.time()}.txt'))
     logger = logging.getLogger()
     logger.addHandler(file_handler)
 

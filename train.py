@@ -8,7 +8,12 @@ import numpy as np
 from scipy.sparse import SparseEfficiencyWarning
 
 from subgraph_extraction.datasets import SubgraphDataset, generate_subgraph_datasets
-from utils.initialization_utils import initialize_experiment, initialize_model, load_pretrained_vae_branch
+from utils.initialization_utils import (
+    initialize_experiment,
+    initialize_model,
+    load_pretrained_vae_branch,
+    save_experiment_params,
+)
 from utils.graph_utils import collate_dgl, move_batch_to_device_dgl
 
 from model.dgl.graph_classifier import GraphClassifier as dgl_model
@@ -47,19 +52,44 @@ def apply_causal_mode_defaults(params):
 
     params.use_cignn_mask = True
     params.use_causal_effect_loss = True
+    params.use_vae_loss = True
     params.use_mi_loss = True
     params.use_cmi_loss = True
-    params.cignn_mask_mode = 'both'
+    # A single edge gate is enough; using "both" squares the same mask because
+    # GraIL aggregates msg * attention.
+    params.cignn_mask_mode = 'attention_only'
     params.mask_injection_gamma = 1.0
+    params.mask_gamma_schedule = 'linear'
+    params.mask_ramp_epochs = max(getattr(params, 'mask_ramp_epochs', 0), 10)
     params.lambda_effect = 0.5
+    params.lambda_vae = 0.1
     params.lambda_mi = 0.05
     params.lambda_cmi = 0.05
     params.lambda_sparse = 0.001
-    # Causal full mode learns masks from the prediction/effect objective.
-    # VAE reconstruction is left available as an optional auxiliary loss.
-    params.use_vae_loss = False
     params.pretrain_vae_only = False
-    params.warmup_epochs = 0
+    params.warmup_epochs = max(getattr(params, 'warmup_epochs', 0), 50)
+
+
+def infer_relation_count(file_paths, relation2id_path):
+    if os.path.exists(relation2id_path):
+        with open(relation2id_path) as f:
+            return len(json.load(f))
+
+    rels = set()
+    for path in file_paths.values():
+        with open(path, 'r') as f:
+            for line in f:
+                parts = line.strip().split('\t')
+                if len(parts) == 3:
+                    rels.add(parts[1])
+    return len(rels)
+
+
+def sync_params_from_dataset(params, dataset):
+    params.num_rels = int(dataset.num_rels)
+    params.aug_num_rels = int(dataset.aug_num_rels)
+    params.inp_dim = int(dataset.n_feat_dim)
+    params.max_label_value = [int(dataset.max_n_label[0]), int(dataset.max_n_label[1])]
 
 
 def main(params):
@@ -85,6 +115,9 @@ def main(params):
                             num_neg_samples_per_link=params.num_neg_samples_per_link,
                             use_kge_embeddings=params.use_kge_embeddings, dataset=params.dataset,
                             kge_model=params.kge_model, file_name=params.valid_file)
+
+    sync_params_from_dataset(params, train)
+    save_experiment_params(params)
 
     # 4. 初始化模型 (此时 params 已经包含了完整的动态参数，且已记录在 JSON)
     graph_classifier = initialize_model(params, dgl_model, params.load_model)
@@ -195,24 +228,19 @@ if __name__ == '__main__':
         'valid': os.path.join(params.main_dir, 'data/{}/{}.txt'.format(params.dataset, params.valid_file))
     }
 
-    # --- 2. 🌟 核心优化：动态预扫描 (必须在 initialize_experiment 之前执行) ---
+    # --- 2. 动态预扫描 (必须在 initialize_experiment 之前执行) ---
     logging.info(f"📊 正在预扫描数据集 {params.dataset} 以动态确定模型维度...")
     try:
-        rels = set()
         if not os.path.exists(params.file_paths['train']):
              raise FileNotFoundError(f"未找到训练文件: {params.file_paths['train']}")
-             
-        with open(params.file_paths['train'], 'r') as f:
-            for line in f:
-                parts = line.strip().split('\t')
-                if len(parts) == 3:
-                    rels.add(parts[1])
+
+        relation2id_path = os.path.join(params.main_dir, f'data/{params.dataset}/relation2id.json')
         
-        # 将结果显式注入 params 对象
-        params.num_rels = len(rels)
-        params.aug_num_rels = params.num_rels
+        # 将结果显式注入 params 对象；最终维度会在 SubgraphDataset 加载后再次校准。
+        params.num_rels = infer_relation_count(params.file_paths, relation2id_path)
+        params.aug_num_rels = params.num_rels * (2 if params.add_traspose_rels else 1)
         params.max_label_value = params.hop
-        params.inp_dim = 8  # 对于 GraIL，hop=3 时节点特征维度为 8
+        params.inp_dim = 2 * (params.hop + 1)
         
         logging.info(f"✅ 维度参数锁定: Relations={params.num_rels}, MaxLabel={params.max_label_value}")
     except Exception as e:

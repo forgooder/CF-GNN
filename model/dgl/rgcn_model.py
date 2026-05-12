@@ -13,6 +13,7 @@ class RGCN(nn.Module):
     def __init__(self, params):
         super(RGCN, self).__init__()
 
+        self.params = params
         # --- 基础参数初始化 ---
         self.max_label_value = params.max_label_value
         self.inp_dim = params.inp_dim # 输入特征维度 (通常是 GraIL 首层输出的维度，建议设为 8)
@@ -28,6 +29,8 @@ class RGCN(nn.Module):
         self.device = params.device
 
         self.latent_dim = getattr(params, 'latent_dim', 64) # VAE 隐变量维度（建议设为 64，其中 32 用于 alpha，32 用于 beta）
+        if self.latent_dim % 2 != 0:
+            raise ValueError('latent_dim must be even so it can be split into alpha/beta branches.')
         self.encoder = RelationalVAEEncoder(
             in_channels=self.inp_dim, 
             out_channels=self.latent_dim, 
@@ -39,21 +42,18 @@ class RGCN(nn.Module):
         self.decoder = self._internal_decoder_wrapper
 
         self.causal_decoder = nn.Sequential(
-            nn.Linear(params.latent_dim // 2, params.emb_dim),
+            nn.Linear(self.latent_dim // 2, params.emb_dim),
             nn.ReLU(),
             nn.Linear(params.emb_dim, params.emb_dim) # 输出用于计算 aindex
         )
         self.shortcut_decoder = nn.Sequential(
-            nn.Linear(params.latent_dim // 2, params.emb_dim),
+            nn.Linear(self.latent_dim // 2, params.emb_dim),
             nn.ReLU(),
             nn.Linear(params.emb_dim, params.emb_dim)
         )
 
         self.mu = None
         self.logvar = None
-        # --- 因果 VAE 相关参数 ---
-        # 确保 params 中定义了 latent_dim (建议设为 32，即 16 alpha + 16 beta)
-        self.latent_dim = getattr(params, 'latent_dim', 32) 
 
         if self.has_attn:
             self.attn_rel_emb = nn.Embedding(self.aug_num_rels, self.attn_rel_emb_dim, sparse=False)  # 注意：+1 是为了给 "no relation" 留出一个特殊 ID (通常为 num_rels)，以便 attention 机制使用

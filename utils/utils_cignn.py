@@ -1,4 +1,3 @@
-from tkinter.tix import TCL_TIMER_EVENTS
 import torch
 from torch.utils.data import random_split, Subset, DataLoader
 import numpy as np
@@ -201,8 +200,14 @@ def calculate_sigma(Z: torch.Tensor) -> float:
 
     Z_np = Z.detach().cpu().numpy()
     k = squareform(pdist(Z_np, "euclidean"))  # [N, N]
+    if k.shape[0] <= 1:
+        return 0.1
+
     k_sorted = np.sort(k, axis=1)
-    topk = k_sorted[:, :10]
+    # 跳过第 0 个 self-distance=0，避免小 batch 下 sigma 被系统性压小。
+    topk = k_sorted[:, 1:min(11, k_sorted.shape[1])]
+    if topk.size == 0:
+        return 0.1
     sigma = float(np.mean(topk))
 
     if sigma < 0.1:
@@ -245,7 +250,11 @@ def _matrix_renyi_entropy(K: torch.Tensor, alpha: float = 1.01) -> torch.Tensor:
     其中 lambda_i 是 K 的特征值，K 已经 trace-normalized。
     在 torch1.4 下用 symeig 代替 torch.linalg.eigh。
     """
-    eigvals, _ = torch.symeig(K, eigenvectors=False)
+    if hasattr(torch, "linalg") and hasattr(torch.linalg, "eigvalsh"):
+        eigvals = torch.linalg.eigvalsh(K)
+    else:
+        # torch 1.4 中 symeig 的特征值梯度路径需要 eigenvectors=True。
+        eigvals, _ = torch.symeig(K, eigenvectors=True)
     eigvals = torch.clamp(eigvals, min=0.0)
     eigvals = eigvals / (eigvals.sum() + 1e-12)
 

@@ -78,8 +78,8 @@ class RelationalVAEEncoder(nn.Module):
         mu = self.lin_mu(h_agg)
         logstd = self.lin_logstd(h_agg)
         
-        # 限制 logstd 范围防止数值爆炸
-        logstd = torch.clamp(logstd, max=10.0)
+        # 限制 logstd 范围防止早期随机采样把 mask 分支推到饱和区。
+        logstd = torch.clamp(logstd, min=-5.0, max=5.0)
         std = torch.exp(logstd)
         
         # 训练时重参数化采样；评估时使用均值，保证验证/测试可复现。

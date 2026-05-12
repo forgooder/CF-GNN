@@ -4,6 +4,24 @@ import json
 import torch
 
 
+def _jsonable_params(params):
+    serializable = {}
+    for key, value in vars(params).items():
+        if key in {'collate_fn', 'move_batch_to_device'}:
+            continue
+        try:
+            json.dumps(value)
+            serializable[key] = value
+        except TypeError:
+            serializable[key] = str(value)
+    return serializable
+
+
+def save_experiment_params(params):
+    with open(os.path.join(params.exp_dir, "params.json"), 'w') as fout:
+        json.dump(_jsonable_params(params), fout)
+
+
 def initialize_experiment(params, file_name):
     '''
     Makes the experiment directory, sets standard paths and initializes the logger
@@ -33,8 +51,7 @@ def initialize_experiment(params, file_name):
                           in sorted(dict(vars(params)).items())))
     logger.info('============================================')
 
-    with open(os.path.join(params.exp_dir, "params.json"), 'w') as fout:
-        json.dump(vars(params), fout)
+    save_experiment_params(params)
 
 
 def initialize_model(params, model_class, load_model=False):

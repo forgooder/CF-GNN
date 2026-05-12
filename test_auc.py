@@ -38,24 +38,32 @@ def set_random_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
-def apply_causal_mode_defaults(params):
+def apply_causal_mode_defaults(params, force=True):
     """Keep evaluation on the same full causal branch used in training."""
     if getattr(params, 'causal_mode', 'none') != 'full':
         return
 
-    params.use_cignn_mask = True
-    params.use_causal_effect_loss = True
-    params.use_mi_loss = True
-    params.use_cmi_loss = True
-    params.cignn_mask_mode = 'both'
-    params.mask_injection_gamma = 1.0
-    params.lambda_effect = 0.5
-    params.lambda_mi = 0.05
-    params.lambda_cmi = 0.05
-    params.lambda_sparse = 0.001
-    params.use_vae_loss = False
-    params.pretrain_vae_only = False
-    params.warmup_epochs = 0
+    def set_default(name, value, baseline=None):
+        current = getattr(params, name, None)
+        if force or current is None or current == baseline:
+            setattr(params, name, value)
+
+    set_default('use_cignn_mask', True, False)
+    set_default('use_causal_effect_loss', True, False)
+    set_default('use_vae_loss', True, False)
+    set_default('use_mi_loss', True, False)
+    set_default('use_cmi_loss', True, False)
+    set_default('cignn_mask_mode', 'attention_only', 'none')
+    set_default('mask_injection_gamma', 1.0, 0.0)
+    set_default('mask_gamma_schedule', 'linear', 'none')
+    set_default('mask_ramp_epochs', max(getattr(params, 'mask_ramp_epochs', 0), 10), 0)
+    set_default('lambda_effect', 0.5)
+    set_default('lambda_vae', 0.1)
+    set_default('lambda_mi', 0.05)
+    set_default('lambda_cmi', 0.05)
+    set_default('lambda_sparse', 0.001)
+    set_default('pretrain_vae_only', False, True)
+    set_default('warmup_epochs', max(getattr(params, 'warmup_epochs', 0), 50), 0)
 
 
 def _with_default(params, name, value):
@@ -93,6 +101,25 @@ def _file_sha256(path):
 
 def _infer_train_dataset(test_dataset):
     return test_dataset[:-4] if test_dataset.endswith('_ind') else test_dataset
+
+
+def _infer_relation_count(params):
+    relation2id_path = os.path.join(params.main_dir, f'data/{params.train_dataset}/relation2id.json')
+    if os.path.exists(relation2id_path):
+        with open(relation2id_path) as f:
+            return len(json.load(f))
+
+    rels = set()
+    for split in ('train', 'valid'):
+        path = os.path.join(params.main_dir, f'data/{params.train_dataset}/{split}.txt')
+        if not os.path.exists(path):
+            continue
+        with open(path, 'r') as f:
+            for line in f:
+                parts = line.strip().split('\t')
+                if len(parts) == 3:
+                    rels.add(parts[1])
+    return len(rels)
 
 
 def _resolve_train_dir(experiment_name, train_dataset, test_dataset):
@@ -179,7 +206,7 @@ def main(params):
     for key, value in defaults.items():
         _with_default(params, key, value)
 
-    apply_causal_mode_defaults(params)
+    apply_causal_mode_defaults(params, force=cli_params['causal_mode'] == 'full')
     if getattr(params, 'use_causal_effect_loss', False):
         if not getattr(params, 'use_cignn_mask', False) or getattr(params, 'cignn_mask_mode', 'none') == 'none':
             raise RuntimeError(
@@ -188,14 +215,8 @@ def main(params):
             )
 
     if not hasattr(params, 'num_rels') or params.num_rels is None:
-        rels = set()
-        train_path = os.path.join(os.getcwd(), f'data/{params.train_dataset}/train.txt')
-        with open(train_path, 'r') as f:
-            for line in f:
-                parts = line.strip().split('\t')
-                if len(parts) == 3: rels.add(parts[1])
-        params.num_rels = len(rels)
-        params.aug_num_rels = params.num_rels
+        params.num_rels = _infer_relation_count(params)
+        params.aug_num_rels = params.num_rels * (2 if params.add_traspose_rels else 1)
 
     if not hasattr(params, 'max_label_value') or params.max_label_value is None:
         params.max_label_value = params.hop

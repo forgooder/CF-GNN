@@ -174,6 +174,8 @@ class Trainer():
 
         if getattr(self.params, 'pretrain_vae_only', False):
             return self._train_step_vae_pretrain(g_pos, rel_pos, g_neg, rel_neg)
+        if self._warmup_active(epoch):
+            return self._train_step_vae_pretrain(g_pos, rel_pos, g_neg, rel_neg)
 
         if not self._auxiliary_enabled():
             pos_scores = self.graph_classifier(data=g_pos, rel_labels=rel_pos).view(-1)
@@ -435,13 +437,11 @@ class Trainer():
     def _warmup_active(self, epoch):
         if getattr(self.params, 'pretrain_vae_only', False):
             return False
-        if getattr(self.params, 'use_causal_effect_loss', False):
-            return False
         if not self._auxiliary_enabled():
             return False
-        if getattr(self.params, 'load_pretrained_vae', ''):
+        if not getattr(self.params, 'use_vae_loss', False):
             return False
-        if getattr(self.params, 'freeze_vae_after_pretrain', False):
+        if getattr(self.params, 'load_pretrained_vae', ''):
             return False
         return epoch <= getattr(self.params, 'warmup_epochs', 50)
 
@@ -466,7 +466,7 @@ class Trainer():
         if (
             self._auxiliary_enabled()
             and not getattr(self.params, 'load_pretrained_vae', '')
-            and not getattr(self.params, 'freeze_vae_after_pretrain', False)
+            and getattr(self.params, 'use_vae_loss', False)
         ):
             warmup_epochs = getattr(self.params, 'warmup_epochs', 50)
         joint_epoch = max(epoch - warmup_epochs, 0)

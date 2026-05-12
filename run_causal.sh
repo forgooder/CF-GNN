@@ -8,7 +8,7 @@ GPU_ID=0
 echo "🚀 开始 Causal-GraIL 统一自动化训练 (CIGNN 风格)..."
 
 # 只需要运行一次 train.py
-# 内部逻辑：前 50 Epoch 自动预热 VAE，后 50 Epoch 自动开启全量联合训练
+# 内部逻辑：前 50 Epoch 预热 VAE/alpha-beta 解耦，随后线性打开 mask 注入并联合训练 GraIL。
 python train.py \
     -d $DATASET \
     -e $EXP_NAME \
@@ -29,4 +29,4 @@ fi
 echo "------------------------------------------------"
 echo "✅ 自动化训练已完成！"
 echo "📂 结果保存在: experiments/${EXP_NAME}"
-echo "📝 提示：前 50 Epoch 为 VAE 磨刀期，第 51 Epoch 开始正式砍柴。"
+echo "📝 提示：第 51 Epoch 后开始 causal mask + causal effect 联合优化。"
