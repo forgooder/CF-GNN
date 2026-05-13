@@ -43,8 +43,11 @@ class GraphClassifier(nn.Module):
                 getattr(self.params, 'use_cignn_mask', False)
                 and getattr(self.params, 'cignn_mask_mode', 'none') != 'none'
             )
-            if getattr(self.params, 'use_causal_effect_loss', False) and not use_cignn_mask:
-                raise RuntimeError('Causal-effect inference requires CIGNN mask; refusing baseline fallback.')
+            if (
+                getattr(self.params, 'use_causal_effect_loss', False)
+                or getattr(self.params, 'use_cmi_loss', False)
+            ) and not use_cignn_mask:
+                raise RuntimeError('Causal inference requires CIGNN mask; refusing baseline fallback.')
             if not use_cignn_mask:
                 return self.forward(data=g, rel_labels=rel_labels)
 

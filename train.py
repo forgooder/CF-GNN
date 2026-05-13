@@ -46,12 +46,14 @@ def set_random_seed(seed):
 
 
 def apply_causal_mode_defaults(params):
-    """Use one switch to enable the full CIGNN-on-GraIL objective."""
+    """Use one switch to enable the CIGNN-on-GraIL objective."""
     if getattr(params, 'causal_mode', 'none') != 'full':
         return
 
     params.use_cignn_mask = True
-    params.use_causal_effect_loss = True
+    # Causal effect is represented by the CMI objective below; the old
+    # score_alpha - score_beta ranking branch is intentionally disabled.
+    params.use_causal_effect_loss = False
     params.use_vae_loss = True
     params.use_mi_loss = True
     params.use_cmi_loss = True
@@ -61,13 +63,13 @@ def apply_causal_mode_defaults(params):
     params.mask_injection_gamma = 1.0
     params.mask_gamma_schedule = 'linear'
     params.mask_ramp_epochs = max(getattr(params, 'mask_ramp_epochs', 0), 10)
-    params.lambda_effect = 0.5
-    params.lambda_vae = 0.1
-    params.lambda_mi = 0.05
+    params.lambda_effect = 0.0
+    params.lambda_vae = 0.05
+    params.lambda_mi = 0.01
     params.lambda_cmi = 0.05
     params.lambda_sparse = 0.001
     params.pretrain_vae_only = False
-    params.warmup_epochs = max(getattr(params, 'warmup_epochs', 0), 50)
+    params.warmup_epochs = getattr(params, 'warmup_epochs', 0)
 
 
 def infer_relation_count(file_paths, relation2id_path):
@@ -160,12 +162,12 @@ if __name__ == '__main__':
 
     # [C. 训练与超参数]
     parser.add_argument("--lambda_vae", type=float, default=0.5)
-    parser.add_argument("--lambda_mi", type=float, default=0.3)
+    parser.add_argument("--lambda_mi", type=float, default=0.01)
     parser.add_argument("--lambda_cmi", type=float, default=0.1)
-    parser.add_argument("--lambda_effect", type=float, default=0.5)
+    parser.add_argument("--lambda_effect", type=float, default=0.0)
     parser.add_argument("--lambda_sparse", type=float, default=0.001)
     parser.add_argument("--latent_dim", type=int, default=64)
-    parser.add_argument("--warmup_epochs", type=int, default=50)
+    parser.add_argument("--warmup_epochs", type=int, default=0)
     parser.add_argument("--num_epochs", "-ne", type=int, default=150)
     parser.add_argument("--lr", type=float, default=0.01)
     parser.add_argument("--eval_every", type=int, default=3)

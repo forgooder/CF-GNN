@@ -213,8 +213,8 @@ class Trainer():
         kld_loss = zero
         vae_loss = zero
         if getattr(self.params, 'use_vae_loss', False):
-            loss_recon_x, loss_recon_adj, kld_loss = self._compute_vae_loss(
-                pos_pack['g'], pos_pack['node_feats'], pos_pack['z'], pos_pack['mu'], pos_pack['logstd']
+            loss_recon_x, loss_recon_adj, kld_loss = self._compute_pair_vae_loss(
+                pos_pack, neg_pack
             )
             vae_loss = loss_recon_x + loss_recon_adj + kld_loss
 
@@ -243,43 +243,34 @@ class Trainer():
             )
             pos_scores = pos_result['causal_score']
             neg_scores = neg_result['causal_score']
-            pos_effect = pos_result['causal_effect'].view(-1)
-            neg_effect = neg_result['causal_effect'].view(-1)
         else:
-            if getattr(self.params, 'use_causal_effect_loss', False):
-                raise RuntimeError('use_causal_effect_loss=true requires use_cignn_mask=true and cignn_mask_mode != none.')
+            if self._use_cmi_objective():
+                raise RuntimeError('CMI causal objective requires use_cignn_mask=true and cignn_mask_mode != none.')
             pos_scores = self.graph_classifier(data=pos_pack['g'], rel_labels=pos_pack['rel_labels'])
             neg_scores = self.graph_classifier(data=neg_pack['g'], rel_labels=neg_pack['rel_labels'])
             pos_result = None
             neg_result = None
-            pos_effect = None
-            neg_effect = None
 
         pos_scores = pos_scores.view(-1)
         neg_scores = neg_scores.view(-1)
         loss_task = self._compute_task_loss(pos_scores, neg_scores)
 
         loss_effect = zero
-        if getattr(self.params, 'use_causal_effect_loss', False):
-            # The causal effect itself is ranked: positive triples should have
-            # a larger causal-minus-shortcut score than negative triples.
-            loss_effect = self._compute_task_loss(pos_effect, neg_effect)
+        graph_alpha = torch.cat([pos_pack['graph_alpha'], neg_pack['graph_alpha']], dim=0)
+        graph_beta = torch.cat([pos_pack['graph_beta'], neg_pack['graph_beta']], dim=0)
+        y_float = torch.cat([
+            torch.ones(pos_pack['graph_alpha'].size(0), 1, device=self.params.device),
+            torch.zeros(neg_pack['graph_alpha'].size(0), 1, device=self.params.device)
+        ], dim=0)
 
         loss_mi = zero
         if getattr(self.params, 'use_mi_loss', False):
-            alpha_all = torch.cat([pos_pack['alpha'], neg_pack['alpha']], dim=0)
-            beta_all = torch.cat([pos_pack['beta'], neg_pack['beta']], dim=0)
-            loss_mi = calculate_MI(alpha_all, beta_all)
+            loss_mi = calculate_MI(graph_alpha, graph_beta)
 
         loss_cmi = zero
-        if getattr(self.params, 'use_cmi_loss', False):
-            graph_alpha = torch.cat([pos_pack['graph_alpha'], neg_pack['graph_alpha']], dim=0)
-            graph_beta = torch.cat([pos_pack['graph_beta'], neg_pack['graph_beta']], dim=0)
-            y_float = torch.cat([
-                torch.ones(pos_pack['graph_alpha'].size(0), 1, device=self.params.device),
-                torch.zeros(neg_pack['graph_alpha'].size(0), 1, device=self.params.device)
-            ], dim=0)
+        if self._use_cmi_objective():
             loss_cmi = calculate_conditional_MI(graph_alpha, y_float, graph_beta)
+            loss_effect = loss_cmi
 
         loss_sparse = zero
         if use_mask:
@@ -289,14 +280,13 @@ class Trainer():
             ], dim=0).mean()
 
         total_loss = loss_task
-        if getattr(self.params, 'use_causal_effect_loss', False):
-            total_loss = total_loss + getattr(self.params, 'lambda_effect', 0.5) * loss_effect
         if getattr(self.params, 'use_vae_loss', False):
             total_loss = total_loss + self.params.lambda_vae * vae_loss
         if getattr(self.params, 'use_mi_loss', False):
             total_loss = total_loss + self.params.lambda_mi * loss_mi
-        if getattr(self.params, 'use_cmi_loss', False):
-            total_loss = total_loss - self.params.lambda_cmi * loss_cmi
+        if self._use_cmi_objective():
+            cmi_weight = self.params.lambda_cmi if getattr(self.params, 'use_cmi_loss', False) else getattr(self.params, 'lambda_effect', 0.05)
+            total_loss = total_loss - cmi_weight * loss_cmi
         if use_mask:
             total_loss = total_loss + getattr(self.params, 'lambda_sparse', 0.001) * loss_sparse
 
@@ -329,39 +319,31 @@ class Trainer():
         pos_pack = self._encode_graph(g_pos, rel_pos)
         neg_pack = self._encode_graph(g_neg, rel_neg)
 
-        pos_recon_x, pos_recon_adj, pos_kld = self._compute_vae_loss(
-            pos_pack['g'], pos_pack['node_feats'], pos_pack['z'], pos_pack['mu'], pos_pack['logstd']
-        )
-        neg_recon_x, neg_recon_adj, neg_kld = self._compute_vae_loss(
-            neg_pack['g'], neg_pack['node_feats'], neg_pack['z'], neg_pack['mu'], neg_pack['logstd']
-        )
-        loss_recon_x = 0.5 * (pos_recon_x + neg_recon_x)
-        loss_recon_adj = 0.5 * (pos_recon_adj + neg_recon_adj)
-        kld_loss = 0.5 * (pos_kld + neg_kld)
+        loss_recon_x, loss_recon_adj, kld_loss = self._compute_pair_vae_loss(pos_pack, neg_pack)
         vae_loss = loss_recon_x + loss_recon_adj + kld_loss
 
         zero = torch.tensor(0.0, device=self.params.device)
+        graph_alpha = torch.cat([pos_pack['graph_alpha'], neg_pack['graph_alpha']], dim=0)
+        graph_beta = torch.cat([pos_pack['graph_beta'], neg_pack['graph_beta']], dim=0)
+        y_float = torch.cat([
+            torch.ones(pos_pack['graph_alpha'].size(0), 1, device=self.params.device),
+            torch.zeros(neg_pack['graph_alpha'].size(0), 1, device=self.params.device)
+        ], dim=0)
+
         loss_mi = zero
         if getattr(self.params, 'use_mi_loss', False):
-            alpha_all = torch.cat([pos_pack['alpha'], neg_pack['alpha']], dim=0)
-            beta_all = torch.cat([pos_pack['beta'], neg_pack['beta']], dim=0)
-            loss_mi = calculate_MI(alpha_all, beta_all)
+            loss_mi = calculate_MI(graph_alpha, graph_beta)
 
         loss_cmi = zero
-        if getattr(self.params, 'use_cmi_loss', False):
-            graph_alpha = torch.cat([pos_pack['graph_alpha'], neg_pack['graph_alpha']], dim=0)
-            graph_beta = torch.cat([pos_pack['graph_beta'], neg_pack['graph_beta']], dim=0)
-            y_float = torch.cat([
-                torch.ones(pos_pack['graph_alpha'].size(0), 1, device=self.params.device),
-                torch.zeros(neg_pack['graph_alpha'].size(0), 1, device=self.params.device)
-            ], dim=0)
+        if self._use_cmi_objective():
             loss_cmi = calculate_conditional_MI(graph_alpha, y_float, graph_beta)
 
         total_loss = self.params.lambda_vae * vae_loss
         if getattr(self.params, 'use_mi_loss', False):
             total_loss = total_loss + self.params.lambda_mi * loss_mi
-        if getattr(self.params, 'use_cmi_loss', False):
-            total_loss = total_loss - self.params.lambda_cmi * loss_cmi
+        if self._use_cmi_objective():
+            cmi_weight = self.params.lambda_cmi if getattr(self.params, 'use_cmi_loss', False) else getattr(self.params, 'lambda_effect', 0.05)
+            total_loss = total_loss - cmi_weight * loss_cmi
 
         mask = torch.cat([
             self._compute_raw_mask(pos_pack['g'], pos_pack['alpha']),
@@ -431,6 +413,12 @@ class Trainer():
             or getattr(self.params, 'pretrain_vae_only', False)
         )
 
+    def _use_cmi_objective(self):
+        return (
+            getattr(self.params, 'use_cmi_loss', False)
+            or getattr(self.params, 'use_causal_effect_loss', False)
+        )
+
     def _baseline_mode(self):
         return not self._auxiliary_enabled()
 
@@ -443,7 +431,7 @@ class Trainer():
             return False
         if getattr(self.params, 'load_pretrained_vae', ''):
             return False
-        return epoch <= getattr(self.params, 'warmup_epochs', 50)
+        return epoch <= getattr(self.params, 'warmup_epochs', 0)
 
     def _current_gamma(self, epoch):
         target_gamma = getattr(self.params, 'mask_injection_gamma', 0.0)
@@ -468,7 +456,7 @@ class Trainer():
             and not getattr(self.params, 'load_pretrained_vae', '')
             and getattr(self.params, 'use_vae_loss', False)
         ):
-            warmup_epochs = getattr(self.params, 'warmup_epochs', 50)
+            warmup_epochs = getattr(self.params, 'warmup_epochs', 0)
         joint_epoch = max(epoch - warmup_epochs, 0)
         if ramp_epochs == 1:
             return target_gamma
@@ -485,16 +473,14 @@ class Trainer():
             components.append('vae')
         if getattr(self.params, 'use_mi_loss', False):
             components.append('mi')
-        if getattr(self.params, 'use_cmi_loss', False):
-            components.append('cmi')
-        if getattr(self.params, 'use_causal_effect_loss', False):
-            components.append('causal_effect_rank')
-            components.append('sparse')
+        if self._use_cmi_objective():
+            components.append('cmi_effect')
         if (
             getattr(self.params, 'use_cignn_mask', False)
             and getattr(self.params, 'cignn_mask_mode', 'none') != 'none'
         ):
             components.append('causal_mask_effect')
+            components.append('sparse')
         return components
 
     def _compute_raw_mask(self, g, alpha):
@@ -565,33 +551,25 @@ class Trainer():
             pos_result['mask_alpha'].view(-1, 1),
             neg_result['mask_alpha'].view(-1, 1)
         ], dim=0)
-        beta_mask = torch.cat([
-            pos_result['mask_beta'].view(-1, 1),
-            neg_result['mask_beta'].view(-1, 1)
-        ], dim=0)
-        effect = torch.cat([
-            pos_result['causal_effect'].view(-1, 1),
-            neg_result['causal_effect'].view(-1, 1)
+        score = torch.cat([
+            pos_result['causal_score'].view(-1, 1),
+            neg_result['causal_score'].view(-1, 1)
         ], dim=0)
 
         alpha_stats = self._tensor_stats(alpha_mask)
-        beta_stats = self._tensor_stats(beta_mask)
-        effect_stats = self._tensor_stats(effect)
+        score_stats = self._tensor_stats(score)
         logging.info(
             "Causal branch stats: mode=%s gamma=%.6f "
             "alpha_mask_mean=%.6f alpha_mask_std=%.6f "
-            "beta_mask_mean=%.6f beta_mask_std=%.6f "
-            "effect_mean=%.6f effect_std=%.6f",
+            "score_mean=%.6f score_std=%.6f",
             getattr(self.params, 'cignn_mask_mode', 'none'),
             getattr(self.params, 'current_mask_gamma', 0.0),
             alpha_stats['mean'],
             alpha_stats['std'],
-            beta_stats['mean'],
-            beta_stats['std'],
-            effect_stats['mean'],
-            effect_stats['std'],
+            score_stats['mean'],
+            score_stats['std'],
         )
-        return {'alpha': alpha_stats, 'beta': beta_stats, 'effect': effect_stats}
+        return {'alpha': alpha_stats, 'score': score_stats}
 
     def _grad_norm(self, parameters):
         total = 0.0
@@ -619,7 +597,6 @@ class Trainer():
 
         encoder_grad_norm = self._grad_norm(self.graph_classifier.gnn.encoder.parameters())
         causal_decoder_grad_norm = self._grad_norm(self.graph_classifier.gnn.causal_decoder.parameters())
-        shortcut_decoder_grad_norm = self._grad_norm(self.graph_classifier.gnn.shortcut_decoder.parameters())
         predictor_grad_norm = self._grad_norm(predictor_params)
 
         mask_logits = getattr(g_pos, 'mask_logits_ref', None)
@@ -631,7 +608,6 @@ class Trainer():
         logging.info("  GraIL predictor grad norm: %s", predictor_grad_norm)
         logging.info("  VAE/mask encoder grad norm: %s", encoder_grad_norm)
         logging.info("  causal decoder grad norm: %s", causal_decoder_grad_norm)
-        logging.info("  shortcut decoder grad norm: %s", shortcut_decoder_grad_norm)
         logging.info("  mask_logits.requires_grad: %s", bool(mask_logits.requires_grad) if mask_logits is not None else False)
         logging.info("  raw_mask.requires_grad: %s", bool(raw_mask.requires_grad) if raw_mask is not None else False)
         logging.info("  effective_mask.requires_grad: %s", bool(effective_mask.requires_grad) if effective_mask is not None else False)
@@ -646,10 +622,7 @@ class Trainer():
             logging.info("CIGNN mask disabled; VAE/mask branch is not in GraIL message passing.")
         elif gamma > 0:
             encoder_missing = encoder_grad_norm is None or encoder_grad_norm == 0.0
-            decoder_missing = (
-                causal_decoder_grad_norm is None or causal_decoder_grad_norm == 0.0
-                or shortcut_decoder_grad_norm is None or shortcut_decoder_grad_norm == 0.0
-            )
+            decoder_missing = causal_decoder_grad_norm is None or causal_decoder_grad_norm == 0.0
             if encoder_missing or decoder_missing:
                 logging.warning("WARNING: VAE/mask branch receives no gradient from prediction loss.")
 
@@ -752,6 +725,18 @@ class Trainer():
             'graph_beta': graph_beta
         }
 
+    def _compute_pair_vae_loss(self, pos_pack, neg_pack):
+        pos_recon_x, pos_recon_adj, pos_kld = self._compute_vae_loss(
+            pos_pack['g'], pos_pack['node_feats'], pos_pack['z'], pos_pack['mu'], pos_pack['logstd']
+        )
+        neg_recon_x, neg_recon_adj, neg_kld = self._compute_vae_loss(
+            neg_pack['g'], neg_pack['node_feats'], neg_pack['z'], neg_pack['mu'], neg_pack['logstd']
+        )
+        loss_recon_x = 0.5 * (pos_recon_x + neg_recon_x)
+        loss_recon_adj = 0.5 * (pos_recon_adj + neg_recon_adj)
+        kld_loss = 0.5 * (pos_kld + neg_kld)
+        return loss_recon_x, loss_recon_adj, kld_loss
+
     def _compute_vae_loss(self, g, node_feats, z, mu, logstd):
         x_rec = self.graph_classifier.gnn.encoder.reconstruct_decoder(z)
         loss_recon_x = nn.functional.mse_loss(x_rec, node_feats)
@@ -759,8 +744,9 @@ class Trainer():
         u, v = g.edges()
         pos_logits = torch.sum(z[u] * z[v], dim=1)
         num_edges = pos_logits.numel()
-        neg_u = torch.randint(0, g.num_nodes(), (num_edges,), device=self.params.device)
-        neg_v = torch.randint(0, g.num_nodes(), (num_edges,), device=self.params.device)
+        num_nodes = g.number_of_nodes()
+        neg_u = torch.randint(0, num_nodes, (num_edges,), device=self.params.device)
+        neg_v = torch.randint(0, num_nodes, (num_edges,), device=self.params.device)
         neg_logits = torch.sum(z[neg_u] * z[neg_v], dim=1)
         recon_logits = torch.cat([pos_logits, neg_logits], dim=0)
         recon_labels = torch.cat([

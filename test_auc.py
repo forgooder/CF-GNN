@@ -49,7 +49,7 @@ def apply_causal_mode_defaults(params, force=True):
             setattr(params, name, value)
 
     set_default('use_cignn_mask', True, False)
-    set_default('use_causal_effect_loss', True, False)
+    set_default('use_causal_effect_loss', False, True)
     set_default('use_vae_loss', True, False)
     set_default('use_mi_loss', True, False)
     set_default('use_cmi_loss', True, False)
@@ -57,13 +57,13 @@ def apply_causal_mode_defaults(params, force=True):
     set_default('mask_injection_gamma', 1.0, 0.0)
     set_default('mask_gamma_schedule', 'linear', 'none')
     set_default('mask_ramp_epochs', max(getattr(params, 'mask_ramp_epochs', 0), 10), 0)
-    set_default('lambda_effect', 0.5)
-    set_default('lambda_vae', 0.1)
-    set_default('lambda_mi', 0.05)
+    set_default('lambda_effect', 0.0)
+    set_default('lambda_vae', 0.05)
+    set_default('lambda_mi', 0.01)
     set_default('lambda_cmi', 0.05)
     set_default('lambda_sparse', 0.001)
     set_default('pretrain_vae_only', False, True)
-    set_default('warmup_epochs', max(getattr(params, 'warmup_epochs', 0), 50), 0)
+    set_default('warmup_epochs', getattr(params, 'warmup_epochs', 0), 0)
 
 
 def _with_default(params, name, value):
@@ -200,17 +200,17 @@ def main(params):
         'freeze_vae_after_pretrain': False, 'cignn_mask_mode': 'none',
         'mask_injection_gamma': 0.0, 'mask_gamma_schedule': 'none',
         'mask_ramp_epochs': 0, 'debug_baseline_check': False,
-        'debug_grad_check': False, 'lambda_effect': 0.5,
+        'debug_grad_check': False, 'lambda_effect': 0.0,
         'lambda_sparse': 0.001, 'warmup_epochs': 0,
     }
     for key, value in defaults.items():
         _with_default(params, key, value)
 
     apply_causal_mode_defaults(params, force=cli_params['causal_mode'] == 'full')
-    if getattr(params, 'use_causal_effect_loss', False):
+    if getattr(params, 'use_causal_effect_loss', False) or getattr(params, 'use_cmi_loss', False):
         if not getattr(params, 'use_cignn_mask', False) or getattr(params, 'cignn_mask_mode', 'none') == 'none':
             raise RuntimeError(
-                'Causal-effect checkpoint/config requested, but CIGNN mask is disabled. '
+                'Causal checkpoint/config requested, but CIGNN mask is disabled. '
                 'Use --causal_mode full or fix params.json.'
             )
 

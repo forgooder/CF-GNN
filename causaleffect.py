@@ -1,6 +1,4 @@
-import numpy as np
 import torch
-import torch.nn as nn
 import dgl
 from utils.utils_cignn import calculate_conditional_MI
 
@@ -23,10 +21,6 @@ def dgl_global_add_pool(graph, feat):
 # 条件互信息 + 因果效应计算 (DGL 适配版)
 #######################################################
 
-import dgl
-import torch
-from utils.utils_cignn import calculate_conditional_MI
-
 def _edge_mask_from_latent(latent, decoder, data, device):
     u, v = data.edges()
     u, v = u.to(device), v.to(device)
@@ -46,40 +40,26 @@ def joint_uncond(alpha, beta, data, rel_labels, causal_decoder, shortcut_decoder
     beta = beta.to(device)
     rel_labels = rel_labels.to(device)
 
-    # 1) 图级 Readout (得到 Alpha_G, Beta_G)
-    data.ndata['tmp_alpha'] = alpha
-    data.ndata['tmp_beta'] = beta
-    graph_alpha = dgl.mean_nodes(data, 'tmp_alpha') 
-    graph_beta = dgl.mean_nodes(data, 'tmp_beta')
-    data.ndata.pop('tmp_alpha')
-    data.ndata.pop('tmp_beta')
-
-    # 2) 标签处理
-    y_float = rel_labels.float().view(-1, 1)
-
-    # 3) 双分支掩码：alpha 负责 causal graph，beta 负责 shortcut graph。
+    # 1) alpha 负责生成 causal graph；beta 只作为 CMI 条件变量。
     mask_alpha, logits_alpha = _edge_mask_from_latent(alpha, causal_decoder, data, device)
-    mask_beta, logits_beta = _edge_mask_from_latent(beta, shortcut_decoder, data, device)
 
-    # 4) 同一个 GraIL predictor 分别在 causal/shortcut graph 上打分。
+    # 2) GraIL predictor 只在 causal graph 上打分。
     score_alpha = classifier(
         data=data,
         rel_labels=rel_labels,
         edge_weight=mask_alpha,
         edge_mask_logits=logits_alpha
     )
-    score_beta = classifier(
-        data=data,
-        rel_labels=rel_labels,
-        edge_weight=mask_beta,
-        edge_mask_logits=logits_beta
-    )
 
-    # 5) causal effect 是可反传的分数差，直接进入 Trainer 的 ranking loss。
-    causal_effect = score_alpha - score_beta
-
-    # 6) 可选 CMI；主训练里会用正负样本拼接后的 y 再计算一次。
+    # 3) 可选 CMI；主训练会用正负样本拼接后的 binary y 计算。
     if compute_cmi:
+        data.ndata['tmp_alpha'] = alpha
+        data.ndata['tmp_beta'] = beta
+        graph_alpha = dgl.mean_nodes(data, 'tmp_alpha')
+        graph_beta = dgl.mean_nodes(data, 'tmp_beta')
+        data.ndata.pop('tmp_alpha')
+        data.ndata.pop('tmp_beta')
+        y_float = rel_labels.float().view(-1, 1)
         cmi = calculate_conditional_MI(
             graph_alpha, y_float, graph_beta
         )
@@ -88,10 +68,8 @@ def joint_uncond(alpha, beta, data, rel_labels, causal_decoder, shortcut_decoder
 
     return {
         "causal_score": score_alpha,
-        "shortcut_score": score_beta,
-        "causal_effect": causal_effect,
+        "causal_effect": cmi,
         "mask_alpha": mask_alpha,
-        "mask_beta": mask_beta,
         "cmi": cmi,
     }
 

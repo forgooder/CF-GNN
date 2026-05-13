@@ -15,7 +15,7 @@ class RelationalVAEEncoder(nn.Module):
         self.out_channels = out_channels    # VAE 隐变量维度 (建议设为 64，其中 32 用于 alpha，32 用于 beta)
 
         # 🌟 新增：升维垫片，将 8 维输入线性映射到 64 维，
-        self.input_projection = nn.Linear(in_channels, out_channels).to(device)
+        self.input_projection = nn.Linear(in_channels, out_channels)
         
         # --- 基础矩阵设计 (同 GraIL Basis 逻辑) ---
         # weight: [num_bases, in_dim, 2 * out_dim]
@@ -71,7 +71,7 @@ class RelationalVAEEncoder(nn.Module):
         
         # 4. 归一化处理
         # 计算入度并进行倒数缩放，防止节点邻居多导致特征爆炸
-        degs = g.in_degrees().float().clamp(min=1).to(self.device).unsqueeze(1)
+        degs = g.in_degrees().float().clamp(min=1).to(h_input.device).unsqueeze(1)
         h_agg = h_agg / degs
 
         # 5. 生成 VAE 潜在分布参数 (均值和标准差对数)

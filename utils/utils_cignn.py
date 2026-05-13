@@ -215,10 +215,16 @@ def calculate_sigma(Z: torch.Tensor) -> float:
     return sigma
 
 
+def _trace_normalize(K: torch.Tensor) -> torch.Tensor:
+    trace = torch.trace(K)
+    K = K / (trace + 1e-12)
+    return 0.5 * (K + K.t())
+
+
 def calculate_gram_mat(x: torch.Tensor, sigma: float) -> torch.Tensor:
     """
     根据 matrix-based Renyi 熵构造 Gaussian 核矩阵：
-      K_ij = exp(-||x_i - x_j||^2 / (2 sigma^2))
+      K_ij = exp(-||x_i - x_j||^2 / sigma)
     然后做 trace 归一化：K = K / trace(K)
     """
     if x.dim() == 1:
@@ -230,17 +236,8 @@ def calculate_gram_mat(x: torch.Tensor, sigma: float) -> torch.Tensor:
     sq_dist = xx + xx.t() - 2.0 * x_flat @ x_flat.t()
     sq_dist = torch.clamp(sq_dist, min=0.0)
 
-    K = torch.exp(-sq_dist / (2.0 * (sigma ** 2) + 1e-12))
-
-    trace = torch.trace(K)
-    if trace.item() > 0:
-        K = K / trace
-    else:
-        K = K / (K.sum() + 1e-12)
-
-    K = 0.5 * (K + K.t())
-    K = torch.clamp(K, min=0.0)
-    return K
+    K = torch.exp(-sq_dist / (sigma + 1e-12))
+    return torch.clamp(_trace_normalize(K), min=0.0)
 
 
 def _matrix_renyi_entropy(K: torch.Tensor, alpha: float = 1.01) -> torch.Tensor:
@@ -267,6 +264,13 @@ def _matrix_renyi_entropy(K: torch.Tensor, alpha: float = 1.01) -> torch.Tensor:
     return ent
 
 
+def _entropy_from_kernel_product(*kernels: torch.Tensor) -> torch.Tensor:
+    K = kernels[0]
+    for kernel in kernels[1:]:
+        K = K * kernel
+    return _matrix_renyi_entropy(torch.clamp(_trace_normalize(K), min=0.0))
+
+
 def reyi_entropy(x: torch.Tensor, sigma: float) -> torch.Tensor:
     """
     对数据 x 计算矩阵 Renyi 熵。
@@ -279,11 +283,11 @@ def reyi_entropy(x: torch.Tensor, sigma: float) -> torch.Tensor:
 def joint_entropy(x: torch.Tensor, y: torch.Tensor,
                   s_x: float, s_y: float) -> torch.Tensor:
     """
-    联合熵 H(X, Y)：先拼接 [x, y]，再算一遍熵。
+    联合熵 H(X, Y)：CI-GNN 使用归一化 Gram 矩阵的 Hadamard 积。
     """
-    xy = torch.cat([x, y], dim=-1)
-    sigma_xy = (s_x + s_y) / 2.0
-    return reyi_entropy(xy, sigma_xy)
+    Kx = calculate_gram_mat(x, s_x)
+    Ky = calculate_gram_mat(y, s_y)
+    return _entropy_from_kernel_product(Kx, Ky)
 
 
 def joint_entropy3(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor,
@@ -291,21 +295,24 @@ def joint_entropy3(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor,
     """
     三元联合熵 H(X, Y, Z)
     """
-    xyz = torch.cat([x, y, z], dim=-1)
-    sigma_xyz = (s_x + s_y + s_z) / 3.0
-    return reyi_entropy(xyz, sigma_xyz)
+    Kx = calculate_gram_mat(x, s_x)
+    Ky = calculate_gram_mat(y, s_y)
+    Kz = calculate_gram_mat(z, s_z)
+    return _entropy_from_kernel_product(Kx, Ky, Kz)
 
 
 def calculate_MI(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """
     互信息 I(X; Y) = H(X) + H(Y) - H(X, Y)
     """
-    s_x = calculate_sigma(x)
-    s_y = calculate_sigma(y)
+    s_x = calculate_sigma(x) ** 2
+    s_y = calculate_sigma(y) ** 2
 
-    Hx = reyi_entropy(x, s_x)
-    Hy = reyi_entropy(y, s_y)
-    Hxy = joint_entropy(x, y, s_x, s_y)
+    Kx = calculate_gram_mat(x, s_x)
+    Ky = calculate_gram_mat(y, s_y)
+    Hx = _matrix_renyi_entropy(Kx)
+    Hy = _matrix_renyi_entropy(Ky)
+    Hxy = _entropy_from_kernel_product(Kx, Ky)
 
     MI = Hx + Hy - Hxy
     return MI
@@ -318,14 +325,18 @@ def calculate_conditional_MI(x: torch.Tensor,
     条件互信息 I(X; Y | Z)
       = H(X, Z) + H(Y, Z) - H(Z) - H(X, Y, Z)
     """
-    s_x = calculate_sigma(x)
-    s_y = calculate_sigma(y)
-    s_z = calculate_sigma(z)
+    s_x = calculate_sigma(x) ** 2
+    s_y = calculate_sigma(y) ** 2
+    s_z = calculate_sigma(z) ** 2
 
-    Hxz = joint_entropy(x, z, s_x, s_z)
-    Hyz = joint_entropy(y, z, s_y, s_z)
-    Hz = reyi_entropy(z, s_z)
-    Hxyz = joint_entropy3(x, y, z, s_x, s_y, s_z)
+    Kx = calculate_gram_mat(x, s_x)
+    Ky = calculate_gram_mat(y, s_y)
+    Kz = calculate_gram_mat(z, s_z)
+
+    Hxz = _entropy_from_kernel_product(Kx, Kz)
+    Hyz = _entropy_from_kernel_product(Ky, Kz)
+    Hz = _matrix_renyi_entropy(Kz)
+    Hxyz = _entropy_from_kernel_product(Kx, Ky, Kz)
 
     CMI = Hxz + Hyz - Hz - Hxyz
     return CMI
